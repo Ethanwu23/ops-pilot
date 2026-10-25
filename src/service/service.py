@@ -2,6 +2,8 @@ import inspect
 import json
 import logging
 import warnings
+import asyncio
+import httpx
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
@@ -29,6 +31,7 @@ from langsmith import Client as LangsmithClient
 from langsmith import uuid7
 
 from agents import DEFAULT_AGENT, AgentGraph, get_agent, get_all_agent_info, load_agent
+from agents.context import AgentContext
 from core import settings
 from memory import initialize_database, initialize_store
 from schema import (
@@ -83,7 +86,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """
     try:
         # Initialize both checkpointer (for short-term memory) and store (for long-term memory)
-        async with initialize_database() as saver, initialize_store() as store:
+        async with (
+            initialize_database() as saver,
+            initialize_store() as store,
+            httpx.AsyncClient(
+                base_url="http://127.0.0.1:8081",
+                timeout=2.0,
+                trust_env=False,
+            ) as metrics_client,
+        ):
+            # 每个服务进程共享一个指标客户端和一组并发名额。
+            app.state.metrics_client = metrics_client
+            app.state.metrics_semaphore = asyncio.Semaphore(2)
             # Set up both components
             if hasattr(saver, "setup"):  # ignore: union-attr
                 await saver.setup()
@@ -193,6 +207,10 @@ async def _handle_input(
     kwargs = {
         "input": input,
         "config": config,
+        "context": AgentContext(
+            metrics_client=app.state.metrics_client,
+            metrics_semaphore=app.state.metrics_semaphore,
+        ),
     }
 
     return kwargs, run_id
