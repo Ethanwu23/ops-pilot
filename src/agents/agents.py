@@ -3,8 +3,7 @@ from dataclasses import dataclass
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.pregel import Pregel
 
-
-from agents.chatbot import chatbot
+from agents.diagnostic_graph import diagnostic_graph
 from agents.lazy_agent import LazyLoadingAgent
 from schema import AgentInfo
 
@@ -25,7 +24,10 @@ class Agent:
 
 
 agents: dict[str, Agent] = {
-    "chatbot": Agent(description="基础对话助手", graph_like=chatbot),
+    "chatbot": Agent(
+        description="运维诊断助手",
+        graph_like=diagnostic_graph,
+    ),
 }
 
 
