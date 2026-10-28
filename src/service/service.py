@@ -1,14 +1,14 @@
+import asyncio
 import inspect
 import json
 import logging
 import warnings
-import asyncio
-import httpx
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
+import httpx
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, status
 from fastapi.responses import StreamingResponse
 from fastapi.routing import APIRoute
@@ -34,6 +34,10 @@ from agents import DEFAULT_AGENT, AgentGraph, get_agent, get_all_agent_info, loa
 from agents.context import AgentContext
 from core import settings
 from memory import initialize_database, initialize_store
+from persistence.database import (
+    create_business_engine,
+    create_business_session_factory,
+)
 from schema import (
     ChatHistory,
     ChatHistoryInput,
@@ -80,12 +84,11 @@ def verify_bearer(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    """
-    Configurable lifespan that initializes the appropriate database checkpointer, store,
-    and agents with async loading - for example for starting up MCP clients.
-    """
+    """初始化并清理服务进程共享的资源。"""
+    business_engine = create_business_engine()
+    business_session_factory = create_business_session_factory(business_engine)
+
     try:
-        # Initialize both checkpointer (for short-term memory) and store (for long-term memory)
         async with (
             initialize_database() as saver,
             initialize_store() as store,
@@ -95,14 +98,17 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                 trust_env=False,
             ) as metrics_client,
         ):
-            # 每个服务进程共享一个指标客户端和一组并发名额。
+            # 保存可安全共享的资源。
             app.state.metrics_client = metrics_client
             app.state.metrics_semaphore = asyncio.Semaphore(2)
-            # Set up both components
-            if hasattr(saver, "setup"):  # ignore: union-attr
+            app.state.business_session_factory = business_session_factory
+
+            # 初始化 LangGraph Checkpoint。
+            if hasattr(saver, "setup"):
                 await saver.setup()
-            # Only setup store for Postgres as InMemoryStore doesn't need setup
-            if hasattr(store, "setup"):  # ignore: union-attr
+
+            # 初始化 LangGraph Store。
+            if hasattr(store, "setup"):
                 await store.setup()
 
             if not settings.AUTH_SECRET:
@@ -111,25 +117,25 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
                     "Set AUTH_SECRET in your environment to enable bearer token authentication."
                 )
 
-            # Configure agents with both memory components and async loading
+            # 加载 Agent，并绑定 Checkpoint 和 Store。
             agents = get_all_agent_info()
-            for a in agents:
+            for agent_info in agents:
                 try:
-                    await load_agent(a.key)
-                    logger.info(f"Agent loaded: {a.key}")
-                except Exception as e:
-                    logger.error(f"Failed to load agent {a.key}: {e}")
-                    # Continue with other agents rather than failing startup
+                    await load_agent(agent_info.key)
+                    logger.info(f"Agent loaded: {agent_info.key}")
+                except Exception as exc:
+                    logger.error(f"Failed to load agent {agent_info.key}: {exc}")
 
-                agent = get_agent(a.key)
-                # Set checkpointer for thread-scoped memory (conversation history)
+                agent = get_agent(agent_info.key)
                 agent.checkpointer = saver
-                # Set store for long-term memory (cross-conversation knowledge)
                 agent.store = store
+
             yield
-    except Exception as e:
-        logger.error(f"Error during database/store/agents initialization: {e}")
+    except Exception as exc:
+        logger.error(f"Error during database/store/agents initialization: {exc}")
         raise
+    finally:
+        await business_engine.dispose()
 
 
 app = FastAPI(lifespan=lifespan, generate_unique_id_function=custom_generate_unique_id)
@@ -210,6 +216,7 @@ async def _handle_input(
         "context": AgentContext(
             metrics_client=app.state.metrics_client,
             metrics_semaphore=app.state.metrics_semaphore,
+            business_session_factory=app.state.business_session_factory,
         ),
     }
 

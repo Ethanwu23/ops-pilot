@@ -1,5 +1,7 @@
 import json
+from time import perf_counter
 from typing import Literal
+from uuid import UUID
 
 import httpx
 from langchain_core.exceptions import OutputParserException
@@ -7,7 +9,6 @@ from langchain_core.messages import (
     AIMessage,
     HumanMessage,
     SystemMessage,
-    ToolMessage,
 )
 from langchain_core.runnables import RunnableConfig
 from langgraph.prebuilt import ToolNode
@@ -19,12 +20,46 @@ from pydantic import ValidationError
 
 from agents.asset_tool import get_asset
 from agents.diagnostic_state import DiagnosticState
-from agents.evidence import extract_evidence
+from agents.evidence import collect_tool_messages, extract_evidence
 from agents.metrics_tool import get_metrics
 from core import get_model, settings
+from persistence.repositories import (
+    create_pending_tool_log,
+    mark_diagnosis_failed,
+    mark_diagnosis_succeeded,
+    mark_tool_failed,
+    mark_tool_running,
+    mark_tool_succeeded,
+)
 from schema.diagnosis import AnalysisResult
 
 tools = [get_asset, get_metrics]
+
+
+def get_diagnosis_run_id(state: DiagnosticState) -> UUID:
+    """取得当前工作流对应的业务诊断记录 ID。"""
+    diagnosis_run_id = state.get("diagnosis_run_id")
+
+    if not isinstance(diagnosis_run_id, UUID):
+        raise ValueError("缺少有效的诊断记录 ID")
+
+    return diagnosis_run_id
+
+
+def get_run_completion(state: DiagnosticState) -> tuple[UUID, int]:
+    """取得诊断记录 ID，并计算本轮执行耗时。"""
+    diagnosis_run_id = get_diagnosis_run_id(state)
+
+    started_at_monotonic = state.get("started_at_monotonic")
+    if not isinstance(started_at_monotonic, float):
+        raise ValueError("缺少有效的诊断开始时间")
+
+    duration_ms = max(
+        0,
+        int((perf_counter() - started_at_monotonic) * 1000),
+    )
+
+    return diagnosis_run_id, duration_ms
 
 
 async def request_model(
@@ -82,6 +117,54 @@ async def execute_tools(
     config: RunnableConfig,
 ) -> DiagnosticState:
     """执行模型请求的工具，并记录可预期的工具故障。"""
+    if not state["messages"]:
+        raise ValueError("执行工具前缺少消息")
+
+    request_message = state["messages"][-1]
+    if not isinstance(request_message, AIMessage):
+        raise TypeError("执行工具前最后一条消息必须是 AIMessage")
+
+    if not request_message.tool_calls:
+        raise ValueError("执行工具前缺少工具请求")
+
+    diagnosis_run_id = get_diagnosis_run_id(state)
+    runtime = get_runtime()
+    session_factory = runtime.context.business_session_factory
+
+    tool_logs_by_call_id: dict[str, tuple[int, float]] = {}
+
+    for tool_call in request_message.tool_calls:
+        tool_call_id = tool_call.get("id")
+        tool_name = tool_call.get("name")
+        input_payload = tool_call.get("args")
+
+        if not isinstance(tool_call_id, str) or not tool_call_id:
+            raise ValueError("工具请求缺少有效的调用 ID")
+
+        if not isinstance(tool_name, str) or not tool_name:
+            raise ValueError("工具请求缺少有效的工具名称")
+
+        if not isinstance(input_payload, dict):
+            raise ValueError("工具请求参数必须是对象")
+
+        tool_log_id = await create_pending_tool_log(
+            session_factory,
+            diagnosis_run_id=diagnosis_run_id,
+            tool_call_id=tool_call_id,
+            tool_name=tool_name,
+            input_payload=input_payload,
+        )
+
+        await mark_tool_running(
+            session_factory,
+            tool_log_id=tool_log_id,
+        )
+
+        tool_logs_by_call_id[tool_call_id] = (
+            tool_log_id,
+            perf_counter(),
+        )
+
     tool_node = ToolNode(
         tools,
         handle_tool_errors=format_tool_error,
@@ -95,13 +178,67 @@ async def execute_tools(
 
     tool_messages = tool_result["messages"]
 
-    failed_messages = [
-        message
-        for message in tool_messages
-        if isinstance(message, ToolMessage) and message.status == "error"
-    ]
+    # 复用证据层已有校验，确保工具请求和结果按调用 ID 完整对应。
+    _, validated_tool_messages = collect_tool_messages(state["messages"] + tool_messages)
 
-    if failed_messages:
+    has_failed_tool = False
+
+    for message in validated_tool_messages:
+        tool_log_id, tool_started_at = tool_logs_by_call_id[message.tool_call_id]
+        duration_ms = max(
+            0,
+            int((perf_counter() - tool_started_at) * 1000),
+        )
+
+        if message.status == "error":
+            if not isinstance(message.content, str) or not message.content.strip():
+                raise ValueError("失败工具消息必须包含错误说明")
+
+            await mark_tool_failed(
+                session_factory,
+                tool_log_id=tool_log_id,
+                error_message=message.content,
+                duration_ms=duration_ms,
+            )
+            has_failed_tool = True
+            continue
+
+        if message.status != "success":
+            raise ValueError(f"无法识别的工具消息状态：{message.status}")
+
+        if not isinstance(message.content, str):
+            raise ValueError("成功工具消息必须包含 JSON 字符串")
+
+        try:
+            result_summary = json.loads(message.content)
+        except json.JSONDecodeError:
+            await mark_tool_failed(
+                session_factory,
+                tool_log_id=tool_log_id,
+                error_message="工具结果不是有效的 JSON",
+                duration_ms=duration_ms,
+            )
+            has_failed_tool = True
+            continue
+
+        if not isinstance(result_summary, dict):
+            await mark_tool_failed(
+                session_factory,
+                tool_log_id=tool_log_id,
+                error_message="工具结果 JSON 必须是对象",
+                duration_ms=duration_ms,
+            )
+            has_failed_tool = True
+            continue
+
+        await mark_tool_succeeded(
+            session_factory,
+            tool_log_id=tool_log_id,
+            result_summary=result_summary,
+            duration_ms=duration_ms,
+        )
+
+    if has_failed_tool:
         return {
             "messages": tool_messages,
             "error": "本轮工具执行失败，未生成诊断结果",
@@ -253,8 +390,10 @@ def route_after_analysis(
     return "finish"
 
 
-def finish_analysis(state: DiagnosticState) -> DiagnosticState:
-    """组合证据与分析，生成最终消息并标记成功。"""
+async def finish_analysis(
+    state: DiagnosticState,
+) -> DiagnosticState:
+    """保存结构化分析摘要，并生成成功结果。"""
     if state["error"] is not None:
         raise ValueError("当前状态存在错误，不能标记为成功")
 
@@ -277,6 +416,19 @@ def finish_analysis(state: DiagnosticState) -> DiagnosticState:
         content=json.dumps(payload, ensure_ascii=False),
     )
 
+    diagnosis_run_id, duration_ms = get_run_completion(state)
+    runtime = get_runtime()
+
+    await mark_diagnosis_succeeded(
+        runtime.context.business_session_factory,
+        diagnosis_run_id=diagnosis_run_id,
+        result_summary=json.dumps(
+            analysis.model_dump(mode="json"),
+            ensure_ascii=False,
+        ),
+        duration_ms=duration_ms,
+    )
+
     return {
         "messages": [final_message],
         "status": "succeeded",
@@ -284,8 +436,10 @@ def finish_analysis(state: DiagnosticState) -> DiagnosticState:
     }
 
 
-def finish_direct(state: DiagnosticState) -> DiagnosticState:
-    """结束无需工具的普通回答，不重复添加消息。"""
+async def finish_direct(
+    state: DiagnosticState,
+) -> DiagnosticState:
+    """保存无需工具的直接回答摘要，并标记成功。"""
     if state["error"] is not None:
         raise ValueError("当前状态存在错误，不能标记为成功")
 
@@ -303,19 +457,52 @@ def finish_direct(state: DiagnosticState) -> DiagnosticState:
     if state["evidence"] or state["analysis"] is not None:
         raise ValueError("普通回答路径不应包含诊断证据或分析结果")
 
-    # 回答已由模型节点写入消息历史，此处只更新终态。
+    if not isinstance(message.content, str) or not message.content.strip():
+        raise ValueError("普通回答内容必须是非空字符串")
+
+    diagnosis_run_id, duration_ms = get_run_completion(state)
+    runtime = get_runtime()
+
+    result_summary = {
+        "response_type": "direct",
+        "summary": message.content,
+    }
+
+    await mark_diagnosis_succeeded(
+        runtime.context.business_session_factory,
+        diagnosis_run_id=diagnosis_run_id,
+        result_summary=json.dumps(
+            result_summary,
+            ensure_ascii=False,
+        ),
+        duration_ms=duration_ms,
+    )
+
+    # 回答已经由模型节点加入消息历史，这里只更新终态。
     return {
         "status": "succeeded",
         "error": None,
     }
 
 
-def finish_failure(state: DiagnosticState) -> DiagnosticState:
-    """输出明确的失败结果，清除不可用的分析结果。"""
+async def finish_failure(
+    state: DiagnosticState,
+) -> DiagnosticState:
+    """保存失败状态，并输出明确的失败结果。"""
     error = state["error"]
 
     if not isinstance(error, str) or not error.strip():
         raise ValueError("失败收尾必须提供非空白的错误说明")
+
+    diagnosis_run_id, duration_ms = get_run_completion(state)
+    runtime = get_runtime()
+
+    await mark_diagnosis_failed(
+        runtime.context.business_session_factory,
+        diagnosis_run_id=diagnosis_run_id,
+        error_message=error,
+        duration_ms=duration_ms,
+    )
 
     # 错误说明由上游提供，不直接暴露底层异常详情。
     payload = {

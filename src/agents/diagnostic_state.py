@@ -1,7 +1,13 @@
+from time import perf_counter
 from typing import Literal
+from uuid import UUID
 
+from langchain_core.messages import HumanMessage
+from langchain_core.runnables import RunnableConfig
 from langgraph.graph import MessagesState
+from langgraph.runtime import get_runtime
 
+from persistence.repositories import create_diagnosis_run
 from schema.diagnosis import AnalysisResult, Evidence
 
 
@@ -12,13 +18,47 @@ class DiagnosticState(MessagesState, total=False):
     error: str | None
     evidence: list[Evidence]
     analysis: AnalysisResult | None
+    diagnosis_run_id: UUID
+    started_at_monotonic: float
 
 
-def start_diagnosis(state: DiagnosticState) -> DiagnosticState:
-    """开始本轮诊断，重置执行状态和错误信息。"""
+async def start_diagnosis(
+    state: DiagnosticState,
+    config: RunnableConfig,
+) -> DiagnosticState:
+    """创建业务诊断记录，并初始化本轮工作流状态。"""
+    started_at_monotonic = perf_counter()
+
+    user_message = next(
+        (message for message in reversed(state["messages"]) if isinstance(message, HumanMessage)),
+        None,
+    )
+    if user_message is None:
+        raise ValueError("缺少本轮用户问题")
+
+    if not isinstance(user_message.content, str):
+        raise ValueError("本轮用户问题必须是字符串")
+
+    question = user_message.content.strip()
+    if not question:
+        raise ValueError("本轮用户问题不能为空")
+
+    thread_id = config["configurable"].get("thread_id")
+    if not isinstance(thread_id, str) or not thread_id:
+        raise ValueError("缺少有效的 thread_id")
+
+    runtime = get_runtime()
+    diagnosis_run_id = await create_diagnosis_run(
+        runtime.context.business_session_factory,
+        thread_id=thread_id,
+        question=question,
+    )
+
     return {
         "status": "running",
         "error": None,
         "evidence": [],
         "analysis": None,
+        "diagnosis_run_id": diagnosis_run_id,
+        "started_at_monotonic": started_at_monotonic,
     }
