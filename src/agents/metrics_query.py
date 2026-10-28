@@ -1,7 +1,9 @@
 import asyncio
+
 import httpx
 
-from schema.metrics import MetricsResponse, MetricsLookupInput
+from schema.metrics import MetricsLookupInput, MetricsResponse
+
 
 async def lookup_metrics(
     asset_id: int,
@@ -22,8 +24,5 @@ async def lookup_metrics(
     result = MetricsResponse.model_validate(response.json())
 
     if result.asset_id != request.asset_id:
-        raise ValueError(
-            f"指标响应资产 ID 不匹配："
-            f"请求 {request.asset_id}，返回 {result.asset_id}"
-        )
+        raise ValueError(f"指标响应资产 ID 不匹配：请求 {request.asset_id}，返回 {result.asset_id}")
     return result

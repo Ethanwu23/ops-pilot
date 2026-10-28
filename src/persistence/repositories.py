@@ -1,7 +1,7 @@
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import func, update
+from sqlalchemy import Integer, cast, func, update
 
 from persistence.database import BusinessSessionFactory
 from persistence.models import DiagnosisRun, ToolExecutionLog
@@ -10,6 +10,7 @@ from persistence.models import DiagnosisRun, ToolExecutionLog
 async def create_diagnosis_run(
     session_factory: BusinessSessionFactory,
     *,
+    diagnosis_run_id: UUID,
     thread_id: str,
     question: str,
 ) -> UUID:
@@ -17,15 +18,15 @@ async def create_diagnosis_run(
     async with session_factory() as session:
         async with session.begin():
             diagnosis_run = DiagnosisRun(
+                id=diagnosis_run_id,
                 thread_id=thread_id,
                 status="running",
                 question=question,
             )
             session.add(diagnosis_run)
 
-            # 立即执行 INSERT，以取得 ORM 默认生成的主键。
+            # 立即执行 INSERT，在事务提交前验证约束。
             await session.flush()
-            diagnosis_run_id = diagnosis_run.id
 
     return diagnosis_run_id
 
@@ -243,3 +244,74 @@ async def mark_tool_failed(
 
             if updated_id is None:
                 raise ValueError(f"工具日志不存在或状态不是 running：{tool_log_id}")
+
+
+async def mark_unfinished_execution_failed(
+    session_factory: BusinessSessionFactory,
+    *,
+    diagnosis_run_id: UUID,
+    error_message: str,
+) -> None:
+    """将诊断及其未结束的工具日志原子更新为失败。"""
+    if not error_message:
+        raise ValueError("error_message 不能为空")
+
+    async with session_factory() as session:
+        async with session.begin():
+            tool_duration_ms = func.greatest(
+                0,
+                cast(
+                    func.extract(
+                        "epoch",
+                        func.now()
+                        - func.coalesce(
+                            ToolExecutionLog.started_at,
+                            ToolExecutionLog.created_at,
+                        ),
+                    )
+                    * 1000,
+                    Integer,
+                ),
+            )
+
+            await session.execute(
+                update(ToolExecutionLog)
+                .where(
+                    ToolExecutionLog.diagnosis_run_id == diagnosis_run_id,
+                    ToolExecutionLog.status.in_(("pending", "running")),
+                )
+                .values(
+                    status="failed",
+                    result_summary=None,
+                    error_message=error_message,
+                    finished_at=func.now(),
+                    duration_ms=tool_duration_ms,
+                )
+            )
+
+            diagnosis_duration_ms = func.greatest(
+                0,
+                cast(
+                    func.extract(
+                        "epoch",
+                        func.now() - DiagnosisRun.started_at,
+                    )
+                    * 1000,
+                    Integer,
+                ),
+            )
+
+            await session.execute(
+                update(DiagnosisRun)
+                .where(
+                    DiagnosisRun.id == diagnosis_run_id,
+                    DiagnosisRun.status == "running",
+                )
+                .values(
+                    status="failed",
+                    result_summary=None,
+                    error_message=error_message,
+                    finished_at=func.now(),
+                    duration_ms=diagnosis_duration_ms,
+                )
+            )

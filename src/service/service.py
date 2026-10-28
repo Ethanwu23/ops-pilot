@@ -5,9 +5,10 @@ import logging
 import warnings
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from uuid import UUID, uuid4
 
+import anyio
 import httpx
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -38,6 +39,7 @@ from persistence.database import (
     create_business_engine,
     create_business_session_factory,
 )
+from persistence.repositories import mark_unfinished_execution_failed
 from schema import (
     ChatHistory,
     ChatHistoryInput,
@@ -62,6 +64,28 @@ from service.utils import (
 
 warnings.filterwarnings("ignore", category=LangChainBetaWarning)
 logger = logging.getLogger(__name__)
+PROGRESS_BY_NODE: dict[str, tuple[str, str]] = {
+    "start_diagnosis": (
+        "diagnosis_record_created",
+        "诊断记录已创建",
+    ),
+    "request_model": (
+        "model_response_received",
+        "已收到模型响应",
+    ),
+    "execute_tools": (
+        "tools_finished",
+        "工具执行已结束",
+    ),
+    "prepare_evidence": (
+        "evidence_validated",
+        "工具证据已校验",
+    ),
+    "analyze_evidence": (
+        "analysis_generated",
+        "结构化分析已生成",
+    ),
+}
 
 
 def custom_generate_unique_id(route: APIRoute) -> str:
@@ -167,7 +191,11 @@ async def _handle_input(
     thread_id = user_input.thread_id or str(uuid4())
     user_id = user_input.user_id or str(uuid4())
 
-    configurable = {"thread_id": thread_id, "user_id": user_id}
+    configurable: dict[str, Any] = {
+        "thread_id": thread_id,
+        "user_id": user_id,
+        "diagnosis_run_id": run_id,
+    }
     if user_input.model is not None:
         ensure_model_available(user_input.model)
         configurable["model"] = user_input.model
@@ -181,7 +209,12 @@ async def _handle_input(
 
     if user_input.agent_config:
         # Check for reserved keys (including 'model' even if not in configurable)
-        reserved_keys = {"thread_id", "user_id", "model"}
+        reserved_keys = {
+            "thread_id",
+            "user_id",
+            "model",
+            "diagnosis_run_id",
+        }
         if overlap := reserved_keys & user_input.agent_config.keys():
             raise HTTPException(
                 status_code=422,
@@ -275,6 +308,7 @@ async def message_generator(
     """
     agent: AgentGraph = get_agent(agent_id)
     kwargs, run_id = await _handle_input(user_input, agent, agent_id)
+    terminal_status: Literal["succeeded", "failed"] | None = None
 
     try:
         # Process streamed events from the graph and yield messages over the SSE stream.
@@ -301,7 +335,26 @@ async def message_generator(
                         for interrupt in updates:
                             new_messages.append(AIMessage(content=interrupt.value))
                         continue
+                    progress = PROGRESS_BY_NODE.get(node)
+                    if progress is not None:
+                        stage, content = progress
+                        yield (
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "type": "progress",
+                                    "stage": stage,
+                                    "content": content,
+                                    "run_id": str(run_id),
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n\n"
+                        )
                     updates = updates or {}
+                    status_update = updates.get("status")
+                    if status_update in {"succeeded", "failed"}:
+                        terminal_status = status_update
                     update_messages = updates.get("messages", [])
                     # special cases for using langgraph-supervisor library
                     if "supervisor" in node or "sub-agent" in node:
@@ -371,11 +424,88 @@ async def message_generator(
                     # that the model is asking for a tool to be invoked.
                     # So we only print non-empty content.
                     yield f"data: {json.dumps({'type': 'token', 'content': convert_message_content_to_string(content)})}\n\n"
-    except Exception as e:
-        logger.error(f"Error in message generator: {e}")
-        yield f"data: {json.dumps({'type': 'error', 'content': 'Internal server error'})}\n\n"
-    finally:
-        yield "data: [DONE]\n\n"
+
+        if terminal_status is None:
+            raise RuntimeError("工作流结束但没有产生业务终态")
+
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "done",
+                    "status": terminal_status,
+                    "run_id": str(run_id),
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n"
+        )
+    except asyncio.CancelledError:
+        logger.info(
+            "SSE client disconnected or stream task was cancelled: run_id=%s",
+            run_id,
+        )
+
+        # 客户端断开的取消作用域不能再次取消数据库收尾事务。
+        with anyio.CancelScope(shield=True):
+            try:
+                await mark_unfinished_execution_failed(
+                    app.state.business_session_factory,
+                    diagnosis_run_id=run_id,
+                    error_message="客户端断开，执行已取消",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to finalize cancelled execution: run_id=%s",
+                    run_id,
+                )
+        raise
+    except Exception as exc:
+        logger.error(
+            "Error in message generator: run_id=%s error=%s",
+            run_id,
+            exc,
+        )
+
+        # 流式响应发生未处理异常时，先完成数据库状态收尾。
+        with anyio.CancelScope(shield=True):
+            try:
+                await mark_unfinished_execution_failed(
+                    app.state.business_session_factory,
+                    diagnosis_run_id=run_id,
+                    error_message="执行发生未处理异常",
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to finalize errored execution: run_id=%s",
+                    run_id,
+                )
+
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "error",
+                    "content": "Internal server error",
+                    "run_id": str(run_id),
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n"
+        )
+
+        yield (
+            "data: "
+            + json.dumps(
+                {
+                    "type": "done",
+                    "status": "error",
+                    "run_id": str(run_id),
+                },
+                ensure_ascii=False,
+            )
+            + "\n\n"
+        )
 
 
 def _create_ai_message(parts: dict) -> AIMessage:
@@ -391,7 +521,12 @@ def _sse_response_example() -> dict[int | str, Any]:
             "description": "Server Sent Event Response",
             "content": {
                 "text/event-stream": {
-                    "example": "data: {'type': 'token', 'content': 'Hello'}\n\ndata: {'type': 'token', 'content': ' World'}\n\ndata: [DONE]\n\n",
+                    "example": (
+                        'data: {"type": "progress", "stage": "diagnosis_record_created", '
+                        '"content": "诊断记录已创建", "run_id": "example-run-id"}\n\n'
+                        'data: {"type": "done", "status": "succeeded", '
+                        '"run_id": "example-run-id"}\n\n'
+                    ),
                     "schema": {"type": "string"},
                 }
             },

@@ -47,13 +47,17 @@ async def start_diagnosis(
     if not isinstance(thread_id, str) or not thread_id:
         raise ValueError("缺少有效的 thread_id")
 
+    diagnosis_run_id = config["configurable"].get("diagnosis_run_id")
+    if not isinstance(diagnosis_run_id, UUID):
+        raise ValueError("缺少有效的 run_id")
+
     runtime = get_runtime()
     diagnosis_run_id = await create_diagnosis_run(
         runtime.context.business_session_factory,
+        diagnosis_run_id=diagnosis_run_id,
         thread_id=thread_id,
         question=question,
     )
-
     return {
         "status": "running",
         "error": None,
