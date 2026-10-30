@@ -5,13 +5,19 @@ from fastapi.testclient import TestClient
 from langchain_core.messages import AIMessage
 from langgraph.types import StateSnapshot
 
+from schema.auth import AuthenticatedUser
 from service import app
+from service.auth import get_authenticated_user
 
 
 @pytest.fixture
 def test_client():
     """Fixture to create a FastAPI test client."""
-    return TestClient(app)
+    app.dependency_overrides[get_authenticated_user] = lambda: AuthenticatedUser(user_id="user-123")
+    try:
+        yield TestClient(app)
+    finally:
+        app.dependency_overrides.clear()
 
 
 @pytest.fixture
@@ -51,6 +57,7 @@ def mock_settings(mock_env):
 def mock_httpx():
     """Patch httpx.stream and httpx.get to use our test client."""
 
+    app.dependency_overrides[get_authenticated_user] = lambda: AuthenticatedUser(user_id="user-123")
     with TestClient(app) as client:
 
         def mock_stream(method: str, url: str, **kwargs):
@@ -66,3 +73,4 @@ def mock_httpx():
         with patch("httpx.stream", mock_stream):
             with patch("httpx.get", mock_get):
                 yield
+    app.dependency_overrides.clear()

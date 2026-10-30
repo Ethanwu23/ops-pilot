@@ -23,6 +23,7 @@ from agents.diagnostic_state import DiagnosticState
 from agents.evidence import collect_tool_messages, extract_evidence
 from agents.metrics_tool import get_metrics
 from core import get_model, settings
+from persistence.authorization import AssetAccessDeniedError
 from persistence.repositories import (
     create_pending_tool_log,
     mark_diagnosis_failed,
@@ -94,9 +95,14 @@ def route_after_model(
 
 
 def format_tool_error(
-    error: httpx.HTTPError | PsycopgError | ToolInvocationError | ValueError,
+    error: (
+        AssetAccessDeniedError | httpx.HTTPError | PsycopgError | ToolInvocationError | ValueError
+    ),
 ) -> str:
     """将可预期的工具故障转换为不包含底层细节的错误信息。"""
+    if isinstance(error, AssetAccessDeniedError):
+        return "资产不存在或无权访问"
+
     if isinstance(error, httpx.TimeoutException):
         return "工具调用超时"
 

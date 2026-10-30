@@ -47,6 +47,10 @@ async def start_diagnosis(
     if not isinstance(thread_id, str) or not thread_id:
         raise ValueError("缺少有效的 thread_id")
 
+    user_id = config["configurable"].get("user_id")
+    if not isinstance(user_id, str) or not user_id:
+        raise ValueError("缺少有效的 user_id")
+
     diagnosis_run_id = config["configurable"].get("diagnosis_run_id")
     if not isinstance(diagnosis_run_id, UUID):
         raise ValueError("缺少有效的 run_id")
@@ -55,6 +59,7 @@ async def start_diagnosis(
     diagnosis_run_id = await create_diagnosis_run(
         runtime.context.business_session_factory,
         diagnosis_run_id=diagnosis_run_id,
+        user_id=user_id,
         thread_id=thread_id,
         question=question,
     )

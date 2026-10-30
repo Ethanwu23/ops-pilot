@@ -13,6 +13,7 @@ from langgraph.types import interrupt
 from pydantic import TypeAdapter
 
 from core import settings
+from schema.auth import AuthenticatedUser
 from schema.models import FakeModelName
 
 FAKE_RESPONSE = "The answer is 42"
@@ -134,7 +135,11 @@ def test_agui_no_raw_events(mock_agui_agent, test_client) -> None:
 def test_agui_default_agent_route(mock_agui_agent, test_client) -> None:
     """POST /agui/run falls back to the default agent."""
     with patch("service.agui.get_agent", return_value=model_agent) as mock_get_agent:
-        events = collect_events(test_client, "/agui/run", run_input())
+        events = collect_events(
+            test_client,
+            "/agui/run",
+            run_input(thread_id="default-agent-thread"),
+        )
     from agents import DEFAULT_AGENT
 
     mock_get_agent.assert_called_once_with(DEFAULT_AGENT)
@@ -150,7 +155,7 @@ def test_agui_configurable_passthrough(mock_agui_agent, allow_fake_model, test_c
     """forwardedProps.configurable values reach the agent's configurable."""
     body = run_input(
         thread_id="passthrough-thread",
-        forwardedProps={"configurable": {"model": "fake", "user_id": "user-123"}},
+        forwardedProps={"configurable": {"model": "fake"}},
     )
     collect_events(test_client, "/agui/model-agent/run", body)
     assert captured_configurable.get("model") == "fake"
@@ -161,7 +166,6 @@ def test_agui_records_thread_metadata(mock_agui_agent, test_client) -> None:
     """AG-UI runs record user_id/agent_id so their threads are listed by /threads."""
     body = run_input(
         thread_id="metadata-thread",
-        forwardedProps={"configurable": {"user_id": "user-123"}},
     )
     collect_events(test_client, "/agui/model-agent/run", body)
 
@@ -173,15 +177,15 @@ def test_agui_records_thread_metadata(mock_agui_agent, test_client) -> None:
     assert tup.metadata["agent_id"] == "model-agent"
 
 
-def test_agui_generates_user_id_when_missing(mock_agui_agent, test_client) -> None:
-    """Without a client-supplied user_id the run still records one, as /invoke does."""
+def test_agui_uses_authenticated_user_id(mock_agui_agent, test_client) -> None:
+    """AG-UI records the authenticated user instead of a client-supplied identity."""
     collect_events(test_client, "/agui/model-agent/run", run_input(thread_id="anon-thread"))
 
     tup = model_agent.checkpointer.get_tuple(
         RunnableConfig(configurable={"thread_id": "anon-thread"})
     )
     assert tup is not None
-    assert tup.metadata["user_id"]
+    assert tup.metadata["user_id"] == "user-123"
     assert captured_configurable.get("user_id") == tup.metadata["user_id"]
 
 
@@ -227,24 +231,22 @@ def test_agui_interrupt_and_resume(mock_agui_agent, test_client) -> None:
     assert "Your favorite color is blue" in contents
 
 
-def test_agui_auth(mock_settings, mock_agui_agent, test_client) -> None:
+def test_agui_auth(mock_agui_agent, test_client) -> None:
     """The AG-UI endpoints enforce the same bearer auth as the rest of the service."""
-    from pydantic import SecretStr
+    from service.auth import get_authenticated_user
 
-    mock_settings.AUTH_SECRET = SecretStr("test-secret")
-    response = test_client.post("/agui/model-agent/run", json=run_input())
-    assert response.status_code == 401
+    test_client.app.dependency_overrides.pop(get_authenticated_user, None)
+    try:
+        response = test_client.post("/agui/model-agent/run", json=run_input())
+        assert response.status_code == 401
 
-    response = test_client.post(
-        "/agui/model-agent/run",
-        json=run_input(),
-        headers={"Authorization": "Bearer wrong-secret"},
-    )
-    assert response.status_code == 401
-
-    response = test_client.post(
-        "/agui/model-agent/run",
-        json=run_input(),
-        headers={"Authorization": "Bearer test-secret"},
-    )
-    assert response.status_code == 200
+        response = test_client.post(
+            "/agui/model-agent/run",
+            json=run_input(),
+            headers={"Authorization": "Bearer invalid-token"},
+        )
+        assert response.status_code == 401
+    finally:
+        test_client.app.dependency_overrides[get_authenticated_user] = lambda: AuthenticatedUser(
+            user_id="user-123"
+        )

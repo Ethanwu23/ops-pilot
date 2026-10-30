@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from pydantic import ValidationError
 
 from client import AgentClient, AgentClientError
-from schema import ChatHistory, ChatMessage, UserThreads
+from schema import ChatHistory, ChatMessage
 from schema.task_data import TaskData, TaskDataStatus
 from voice import VoiceManager
 
@@ -26,42 +26,6 @@ from voice import VoiceManager
 
 APP_TITLE = "Agent Service Toolkit"
 APP_ICON = "🧰"
-USER_ID_COOKIE = "user_id"
-
-
-def get_or_create_user_id() -> str:
-    """Get the user ID from session state or URL parameters, or create a new one if it doesn't exist."""
-    # Check if user_id exists in session state
-    if USER_ID_COOKIE in st.session_state:
-        return st.session_state[USER_ID_COOKIE]
-
-    # Try to get from URL parameters using the new st.query_params
-    if USER_ID_COOKIE in st.query_params:
-        user_id = st.query_params[USER_ID_COOKIE]
-        st.session_state[USER_ID_COOKIE] = user_id
-        return user_id
-
-    # Generate a new user_id if not found
-    user_id = str(uuid.uuid4())
-
-    # Store in session state for this session
-    st.session_state[USER_ID_COOKIE] = user_id
-
-    # Also add to URL parameters so it can be bookmarked/shared
-    st.query_params[USER_ID_COOKIE] = user_id
-
-    return user_id
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def fetch_user_threads_cached(
-    base_url: str, user_id: str, agent_id: str | None = None, limit: int = 20
-) -> UserThreads:
-    """
-    Fetch and cache user threads using the new synchronous get_user_threads method.
-    """
-    client = AgentClient(base_url=base_url, get_info=False)
-    return client.get_user_threads(user_id=user_id, agent=agent_id, limit=limit)
 
 
 async def main() -> None:
@@ -88,11 +52,13 @@ async def main() -> None:
         await asyncio.sleep(0.1)
         st.rerun()
 
-    # Get or create user ID
-    user_id = get_or_create_user_id()
-
     if "agent_client" not in st.session_state:
         load_dotenv()
+        access_token = os.getenv("AGENT_ACCESS_TOKEN")
+
+        if not access_token:
+            st.error("AGENT_ACCESS_TOKEN is not configured")
+            st.stop()
         agent_url = os.getenv("AGENT_URL")
         if not agent_url:
             host = os.getenv("HOST", "0.0.0.0")
@@ -100,7 +66,10 @@ async def main() -> None:
             agent_url = f"http://{host}:{port}"
         try:
             with st.spinner("Connecting to agent service..."):
-                st.session_state.agent_client = AgentClient(base_url=agent_url)
+                st.session_state.agent_client = AgentClient(
+                    base_url=agent_url,
+                    access_token=access_token,
+                )
         except AgentClientError as e:
             st.error(f"Error connecting to agent service at {agent_url}: {e}")
             st.markdown("The service might be booting up. Try again in a few seconds.")
@@ -157,10 +126,8 @@ async def main() -> None:
                     agent_client.agent = url_agent
                 else:
                     agent_client.agent = agent_client.info.default_agent
-                user_threads = fetch_user_threads_cached(
-                    base_url=agent_client.base_url,
-                    user_id=user_id,
-                    agent_id=agent_client.agent,
+                user_threads = agent_client.get_user_threads(
+                    agent=agent_client.agent,
                     limit=20,
                 )
                 thread_list = user_threads.threads
@@ -197,7 +164,6 @@ async def main() -> None:
                 index=agent_idx,
                 key="agent",
                 bind="query-params",
-                on_change=fetch_user_threads_cached.clear,
             )
             use_streaming = st.toggle("Stream results", value=True)
             # Audio toggle with callback: clears cached audio when toggled off
@@ -215,9 +181,6 @@ async def main() -> None:
                 ),
                 key="enable_audio",
             )
-
-            # Display user ID (for debugging or user information)
-            st.text_input("User ID (read-only)", value=user_id, disabled=True)
 
         @st.dialog("Architecture")
         def architecture_dialog() -> None:
@@ -248,7 +211,6 @@ async def main() -> None:
                 {
                     "thread_id": st.session_state.thread_id,
                     "agent": agent_client.agent,
-                    USER_ID_COOKIE: user_id,
                 }
             )
             chat_url = f"{st.context.url}?{query}"
@@ -314,7 +276,6 @@ async def main() -> None:
         user_input = st.chat_input()
 
     if user_input:
-        is_first_message = len(messages) == 0
         messages.append(ChatMessage(type="human", content=user_input))
         st.chat_message("human").write(user_input)
         try:
@@ -323,7 +284,6 @@ async def main() -> None:
                     message=user_input,
                     model=model,
                     thread_id=st.session_state.thread_id,
-                    user_id=user_id,
                 )
                 await draw_messages(stream, is_new=True)
                 # Generate TTS audio for streaming response
@@ -344,7 +304,6 @@ async def main() -> None:
                     message=user_input,
                     model=model,
                     thread_id=st.session_state.thread_id,
-                    user_id=user_id,
                 )
                 messages.append(response)
                 # Render AI response with optional voice
@@ -353,8 +312,6 @@ async def main() -> None:
                         voice.render_message(response.content)
                     else:
                         st.write(response.content)
-            if is_first_message:
-                fetch_user_threads_cached.clear()
             st.rerun()  # Clear stale containers
         except AgentClientError as e:
             st.error(f"Error generating response: {e}")

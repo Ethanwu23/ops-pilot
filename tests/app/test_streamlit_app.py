@@ -37,7 +37,6 @@ def test_app_simple_non_streaming(mock_agent_client):
 def test_app_settings(mock_agent_client):
     """Test the full app - happy path"""
     at = AppTest.from_file("../../src/streamlit_app.py")
-    at.query_params["user_id"] = "1234"
     at.run()
 
     PROMPT = "Know any jokes?"
@@ -67,7 +66,6 @@ def test_app_settings(mock_agent_client):
         message=PROMPT,
         model=OpenAIModelName.GPT_5_MINI,
         thread_id=at.session_state.thread_id,
-        user_id="1234",
     )
     assert not at.exception
 
@@ -606,12 +604,9 @@ def test_app_thread_caching_sidebar(mock_agent_client, mock_threads_data):
     mock_agent_client.get_user_threads = Mock(return_value=mock_threads_data)
 
     at = AppTest.from_file("../../src/streamlit_app.py")
-    at.query_params["user_id"] = "user-123"
     at.run()
 
-    mock_agent_client.get_user_threads.assert_called_with(
-        user_id="user-123", agent="test-agent", limit=20
-    )
+    mock_agent_client.get_user_threads.assert_called_with(agent="test-agent", limit=20)
 
     sidebar_buttons = [b.label for b in at.sidebar.button]
     assert "What is Python?" in sidebar_buttons
@@ -631,7 +626,6 @@ def test_app_thread_click_loads_history(mock_agent_client, mock_threads_data):
     )
 
     at = AppTest.from_file("../../src/streamlit_app.py")
-    at.query_params["user_id"] = "user-123"
     at.run()
 
     at.button(key="thread_thread-1111-2222").click().run()
@@ -653,7 +647,6 @@ def test_app_thread_click_history_error(mock_agent_client, mock_threads_data):
     mock_agent_client.get_history = Mock(side_effect=AgentClientError("service down"))
 
     at = AppTest.from_file("../../src/streamlit_app.py")
-    at.query_params["user_id"] = "user-123"
     at.run()
     original_thread_id = at.session_state.thread_id
 
@@ -669,7 +662,6 @@ def test_app_thread_fetch_error_shows_caption(mock_agent_client):
     mock_agent_client.get_user_threads = Mock(side_effect=AgentClientError("service down"))
 
     at = AppTest.from_file("../../src/streamlit_app.py")
-    at.query_params["user_id"] = "user-123"
     at.run()
 
     assert any("Couldn't load conversation history" in caption.value for caption in at.caption)

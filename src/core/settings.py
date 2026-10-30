@@ -78,7 +78,9 @@ class Settings(BaseSettings):
     GRACEFUL_SHUTDOWN_TIMEOUT: int = 30
     LOG_LEVEL: LogLevel = LogLevel.WARNING
 
-    AUTH_SECRET: SecretStr | None = None
+    JWT_SECRET: SecretStr
+    JWT_ISSUER: str = "ops-pilot"
+    JWT_AUDIENCE: str = "ops-pilot-api"
 
     OPENAI_API_KEY: SecretStr | None = None
     DEEPSEEK_API_KEY: SecretStr | None = None

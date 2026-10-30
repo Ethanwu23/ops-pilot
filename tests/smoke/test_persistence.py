@@ -10,6 +10,14 @@ from client import AgentClient
 THREAD_ID = os.environ.get("SMOKE_THREAD_ID", "smoke-test-persistence-thread")
 
 
+def access_token(name: str = "AGENT_ACCESS_TOKEN") -> str:
+    """读取容器验收使用的用户 JWT。"""
+    token = os.getenv(name)
+    if not token:
+        raise RuntimeError(f"{name} is not configured")
+    return token
+
+
 @pytest.mark.docker
 def test_checkpointer_persists_history():
     """Confirm the configured checkpointer persists conversation state across turns.
@@ -25,7 +33,10 @@ def test_checkpointer_persists_history():
     graph that created the thread also reads it back — which is what makes the
     round-trip work now that each agent is a distinct graph with its own state.
     """
-    client = AgentClient("http://localhost:8080")
+    client = AgentClient(
+        "http://localhost:8080",
+        access_token=access_token(),
+    )
 
     client.invoke("Tell me a joke?", thread_id=THREAD_ID, model="fake")
     client.invoke("Tell me another?", thread_id=THREAD_ID, model="fake")
@@ -46,23 +57,28 @@ def test_threads_lists_user_threads():
     (including the step -1 head lookup) behaves the same on Postgres and Mongo.
     Requires a running service (USE_FAKE_MODEL=true) backed by a live database.
     """
-    client = AgentClient("http://localhost:8080")
-    user_id = f"{THREAD_ID}-user"
-    other_user_id = f"{THREAD_ID}-other"
+    client = AgentClient(
+        "http://localhost:8080",
+        access_token=access_token(),
+    )
+    other_client = AgentClient(
+        "http://localhost:8080",
+        access_token=access_token("OTHER_AGENT_ACCESS_TOKEN"),
+    )
 
     single_turn = f"{THREAD_ID}-single"
     multi_turn = f"{THREAD_ID}-multi"
-    client.invoke("Only turn", thread_id=single_turn, user_id=user_id, model="fake")
-    client.invoke("First turn", thread_id=multi_turn, user_id=user_id, model="fake")
-    client.invoke("Second turn", thread_id=multi_turn, user_id=user_id, model="fake")
-    client.invoke("Not mine", thread_id=f"{THREAD_ID}-other", user_id=other_user_id, model="fake")
+    client.invoke("Only turn", thread_id=single_turn, model="fake")
+    client.invoke("First turn", thread_id=multi_turn, model="fake")
+    client.invoke("Second turn", thread_id=multi_turn, model="fake")
+    other_client.invoke("Not mine", thread_id=f"{THREAD_ID}-other", model="fake")
 
-    threads = client.get_user_threads(user_id=user_id).threads
+    threads = client.get_user_threads().threads
     # Most recently updated first; the single-turn thread must be listed even though
     # it never advanced past its head checkpoint.
     assert [t.thread_id for t in threads] == [multi_turn, single_turn]
     assert [t.title for t in threads] == ["First turn", "Only turn"]
     assert all(t.updated_at for t in threads)
 
-    other_threads = client.get_user_threads(user_id=other_user_id).threads
+    other_threads = other_client.get_user_threads().threads
     assert [t.thread_id for t in other_threads] == [f"{THREAD_ID}-other"]

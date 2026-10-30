@@ -1,13 +1,25 @@
 import asyncio
+import os
 
 from client import AgentClient
 from core import settings
 from schema import ChatMessage
 
 
+def get_access_token() -> str:
+    """读取当前用户访问令牌。"""
+    access_token = os.getenv("AGENT_ACCESS_TOKEN")
+    if not access_token:
+        raise RuntimeError("AGENT_ACCESS_TOKEN is not configured")
+    return access_token
+
+
 async def amain() -> None:
     #### ASYNC ####
-    client = AgentClient(settings.BASE_URL)
+    client = AgentClient(
+        settings.BASE_URL,
+        access_token=get_access_token(),
+    )
 
     print("Agent info:")
     print(client.info)
@@ -29,7 +41,10 @@ async def amain() -> None:
 
 def main() -> None:
     #### SYNC ####
-    client = AgentClient(settings.BASE_URL)
+    client = AgentClient(
+        settings.BASE_URL,
+        access_token=get_access_token(),
+    )
 
     print("Agent info:")
     print(client.info)

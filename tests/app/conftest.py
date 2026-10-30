@@ -1,3 +1,4 @@
+import os
 from unittest.mock import patch
 
 import pytest
@@ -21,6 +22,7 @@ def mock_agent_client(mock_env):
     )
 
     with (
+        patch.dict(os.environ, {"AGENT_ACCESS_TOKEN": "test-token"}),
         patch("client.AgentClient") as mock_agent_client,
         patch("voice.VoiceManager.from_env", return_value=None),
     ):

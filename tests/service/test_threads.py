@@ -12,6 +12,8 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from langchain_core.messages import AIMessage, HumanMessage
 
+from agents import DEFAULT_AGENT
+
 
 class FakeCheckpointTuple:
     def __init__(self, thread_id: str, checkpoint_id: str, checkpoint: dict, metadata: dict):
@@ -41,7 +43,7 @@ class FakeCheckpointer:
         self,
         thread_id: str,
         user_id: str = "user-123",
-        agent_id: str = "research-assistant",
+        agent_id: str = DEFAULT_AGENT,
         turns: int = 1,
         title: str = "Hello",
         subgraph_heads: int = 0,
@@ -105,7 +107,7 @@ def test_threads_without_checkpointer_returns_empty(test_client, mock_agent) -> 
     """Test that /threads returns an empty list when the agent has no checkpointer configured."""
     mock_agent.checkpointer = None
 
-    response = test_client.get("/threads", params={"user_id": "user-123", "limit": 10})
+    response = test_client.get("/threads", params={"limit": 10})
 
     assert response.status_code == 200
     assert response.json() == {"threads": []}
@@ -136,7 +138,7 @@ def test_threads_filters_by_agent_id(test_client) -> None:
         return default_agent
 
     with patch("service.service.get_agent", side_effect=agent_lookup):
-        response = test_client.get("/custom-agent/threads", params={"user_id": "user-123"})
+        response = test_client.get("/custom-agent/threads")
 
     assert response.status_code == 200
     payload = response.json()
@@ -152,7 +154,7 @@ def test_threads_rejects_out_of_range_limit(test_client, mock_agent, limit: int)
     """Test that /threads bounds limit so a client can't ask for an unbounded scan."""
     mock_agent.checkpointer = FakeCheckpointer()
 
-    response = test_client.get("/threads", params={"user_id": "user-123", "limit": limit})
+    response = test_client.get("/threads", params={"limit": limit})
 
     assert response.status_code == 422
 
@@ -172,7 +174,7 @@ def test_threads_skips_checkpoints_with_mismatched_metadata(test_client, mock_ag
     checkpointer.add_thread("thread-no-metadata", user_id=None, agent_id=None, title="No metadata")
     mock_agent.checkpointer = checkpointer
 
-    response = test_client.get("/threads", params={"user_id": "user-123", "limit": 10})
+    response = test_client.get("/threads", params={"limit": 10})
 
     assert response.status_code == 200
     assert [t["thread_id"] for t in response.json()["threads"]] == ["thread-mine"]
@@ -190,7 +192,7 @@ def test_threads_pages_past_subgraph_heads(test_client, mock_agent) -> None:
     mock_agent.checkpointer = checkpointer
 
     with patch("service.threads.HEAD_PAGE_SIZE", 20):
-        response = test_client.get("/threads", params={"user_id": "user-123", "limit": 30})
+        response = test_client.get("/threads", params={"limit": 30})
 
     assert response.status_code == 200
     threads = response.json()["threads"]
@@ -209,7 +211,7 @@ def test_threads_bounds_total_rows_scanned(test_client, mock_agent) -> None:
         patch("service.threads.HEAD_PAGE_SIZE", 20),
         patch("service.threads.MAX_HEAD_ROWS", 100),
     ):
-        response = test_client.get("/threads", params={"user_id": "user-123", "limit": 30})
+        response = test_client.get("/threads", params={"limit": 30})
 
     assert response.status_code == 200
     assert len(checkpointer.alist_filters) == 5
@@ -222,7 +224,7 @@ def test_threads_tolerates_missing_timestamp(test_client, mock_agent) -> None:
     checkpointer.add_thread("thread-no-ts", title="No timestamp", tip_ts=None)
     mock_agent.checkpointer = checkpointer
 
-    response = test_client.get("/threads", params={"user_id": "user-123", "limit": 10})
+    response = test_client.get("/threads", params={"limit": 10})
 
     assert response.status_code == 200
     payload = response.json()
@@ -238,5 +240,5 @@ def test_threads_checkpointer_error_returns_500(test_client, mock_agent) -> None
     mock_agent.checkpointer = type("Checkpointer", (), {})()
     mock_agent.checkpointer.alist = broken_alist
 
-    response = test_client.get("/threads", params={"user_id": "user-123", "limit": 10})
+    response = test_client.get("/threads", params={"limit": 10})
     assert response.status_code == 500

@@ -1,3 +1,5 @@
+import os
+
 import pytest
 from streamlit.testing.v1 import AppTest
 
@@ -10,7 +12,11 @@ def test_service_with_fake_model():
 
     This test requires the service container to be running with USE_FAKE_MODEL=true
     """
-    client = AgentClient("http://0.0.0.0", agent="chatbot")
+    client = AgentClient(
+        "http://0.0.0.0",
+        agent="chatbot",
+        access_token=os.environ["AGENT_ACCESS_TOKEN"],
+    )
     response = client.invoke("Tell me a joke?", model="fake")
     assert response.type == "ai"
     assert response.content == "This is a test response from the fake model."

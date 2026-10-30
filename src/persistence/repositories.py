@@ -11,6 +11,7 @@ async def create_diagnosis_run(
     session_factory: BusinessSessionFactory,
     *,
     diagnosis_run_id: UUID,
+    user_id: str,
     thread_id: str,
     question: str,
 ) -> UUID:
@@ -19,6 +20,7 @@ async def create_diagnosis_run(
         async with session.begin():
             diagnosis_run = DiagnosisRun(
                 id=diagnosis_run_id,
+                user_id=user_id,
                 thread_id=thread_id,
                 status="running",
                 question=question,

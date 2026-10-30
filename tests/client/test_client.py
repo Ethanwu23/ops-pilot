@@ -1,5 +1,4 @@
 import json
-import os
 from datetime import UTC, datetime
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -14,7 +13,7 @@ from schema.models import OpenAIModelName
 def test_init(mock_env):
     """Test client initialization with different parameters."""
     # Test default values
-    client = AgentClient(get_info=False)
+    client = AgentClient(get_info=False, access_token="test-token")
     assert client.base_url == "http://0.0.0.0"
     assert client.timeout is None
 
@@ -23,6 +22,7 @@ def test_init(mock_env):
         base_url="http://test",
         timeout=30.0,
         get_info=False,
+        access_token="test-token",
     )
     assert client.base_url == "http://test"
     assert client.timeout == 30.0
@@ -31,15 +31,15 @@ def test_init(mock_env):
 
 
 def test_headers(mock_env):
-    """Test header generation with and without auth."""
-    # Test without auth
-    client = AgentClient(get_info=False)
-    assert client._headers == {}
+    """Test that clients require and send an explicit access token."""
+    with pytest.raises(TypeError):
+        AgentClient(get_info=False)
 
-    # Test with auth
-    with patch.dict(os.environ, {"AUTH_SECRET": "test-secret"}, clear=True):
-        client = AgentClient(get_info=False)
-        assert client._headers == {"Authorization": "Bearer test-secret"}
+    with pytest.raises(ValueError, match="access_token"):
+        AgentClient(get_info=False, access_token="   ")
+
+    client = AgentClient(get_info=False, access_token="test-token")
+    assert client._headers == {"Authorization": "Bearer test-token"}
 
 
 def test_invoke(agent_client):
@@ -332,12 +332,16 @@ def test_info(agent_client):
 
     # Test a fresh client with info
     with patch("httpx.get", return_value=test_response):
-        agent_client = AgentClient(base_url="http://test")
+        agent_client = AgentClient(base_url="http://test", access_token="test-token")
     assert agent_client.info == test_info
     assert agent_client.agent == "custom-agent"
 
     # Test error on invoke if no agent set
-    agent_client = AgentClient(base_url="http://test", get_info=False)
+    agent_client = AgentClient(
+        base_url="http://test",
+        get_info=False,
+        access_token="test-token",
+    )
     with pytest.raises(AgentClientError) as exc:
         agent_client.invoke("test")
     assert "No agent selected. Use update_agent() to select an agent." in str(exc.value)
@@ -345,13 +349,11 @@ def test_info(agent_client):
 
 def test_get_user_threads(agent_client):
     """Test user threads retrieval under various configurations."""
-    USER_ID = "user-123"
-
     MOCK_THREADS_RESPONSE = {
         "threads": [
             {
                 "thread_id": "thread-1",
-                "user_id": USER_ID,
+                "user_id": "user-123",
                 "agent_id": "test-agent",
                 "created_at": datetime.now(UTC).isoformat(),
                 "updated_at": datetime.now(UTC).isoformat(),
@@ -359,7 +361,7 @@ def test_get_user_threads(agent_client):
             },
             {
                 "thread_id": "thread-2",
-                "user_id": USER_ID,
+                "user_id": "user-123",
                 "agent_id": "test-agent",
                 "created_at": datetime.now(UTC).isoformat(),
                 "updated_at": datetime.now(UTC).isoformat(),
@@ -372,7 +374,7 @@ def test_get_user_threads(agent_client):
     mock_response = Response(200, json=MOCK_THREADS_RESPONSE, request=mock_request)
 
     with patch("httpx.get", return_value=mock_response) as mock_get:
-        result = agent_client.get_user_threads(USER_ID)
+        result = agent_client.get_user_threads()
 
         assert isinstance(result, UserThreads)
         assert len(result.threads) == 2
@@ -381,35 +383,29 @@ def test_get_user_threads(agent_client):
         mock_get.assert_called_once()
         args, kwargs = mock_get.call_args
         assert args[0] == "http://test/test-agent/threads"
-        assert kwargs["params"] == {
-            "user_id": USER_ID,
-            "limit": 20,
-        }
+        assert kwargs["params"] == {"limit": 20}
 
     with patch("httpx.get", return_value=mock_response) as mock_get:
-        agent_client.get_user_threads(USER_ID, agent="custom-agent", limit=50)
+        agent_client.get_user_threads(agent="custom-agent", limit=50)
 
         args, kwargs = mock_get.call_args
         assert args[0] == "http://test/custom-agent/threads"
-        assert kwargs["params"] == {
-            "user_id": USER_ID,
-            "limit": 50,
-        }
+        assert kwargs["params"] == {"limit": 50}
 
     agent_client.agent = None
     with patch("httpx.get", return_value=mock_response) as mock_get:
-        agent_client.get_user_threads(USER_ID)
+        agent_client.get_user_threads()
 
         args, kwargs = mock_get.call_args
         assert args[0] == "http://test/threads"
-        assert kwargs["params"] == {"user_id": USER_ID, "limit": 20}
+        assert kwargs["params"] == {"limit": 20}
 
     agent_client.agent = "test-agent"
 
     error_response = Response(500, text="Internal Server Error", request=mock_request)
     with patch("httpx.get", return_value=error_response):
         with pytest.raises(AgentClientError) as exc:
-            agent_client.get_user_threads(USER_ID)
+            agent_client.get_user_threads()
         assert "Error:" in str(exc.value)
         assert "500 Internal Server Error" in str(exc.value)
 
@@ -417,8 +413,6 @@ def test_get_user_threads(agent_client):
 @pytest.mark.asyncio
 async def test_aget_user_threads(agent_client):
     """Test async user threads retrieval."""
-    USER_ID = "user-123"
-
     mock_request = Request("GET", "http://test/test-agent/threads")
     mock_response = Response(
         200,
@@ -436,17 +430,17 @@ async def test_aget_user_threads(agent_client):
     )
 
     with patch("httpx.AsyncClient.get", return_value=mock_response) as mock_get:
-        result = await agent_client.aget_user_threads(USER_ID, agent="custom-agent", limit=50)
+        result = await agent_client.aget_user_threads(agent="custom-agent", limit=50)
 
         assert isinstance(result, UserThreads)
         assert result.threads[0].thread_id == "thread-1"
 
         args, kwargs = mock_get.call_args
         assert args[0] == "http://test/custom-agent/threads"
-        assert kwargs["params"] == {"user_id": USER_ID, "limit": 50}
+        assert kwargs["params"] == {"limit": 50}
 
     error_response = Response(500, text="Internal Server Error", request=mock_request)
     with patch("httpx.AsyncClient.get", return_value=error_response):
         with pytest.raises(AgentClientError) as exc:
-            await agent_client.aget_user_threads(USER_ID)
+            await agent_client.aget_user_threads()
         assert "500 Internal Server Error" in str(exc.value)

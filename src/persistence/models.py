@@ -43,6 +43,11 @@ class DiagnosisRun(Base):
         primary_key=True,
         default=uuid4,
     )
+    user_id: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        index=True,
+    )
     thread_id: Mapped[str] = mapped_column(
         String(100),
         nullable=False,
@@ -151,4 +156,24 @@ class ToolExecutionLog(Base):
     duration_ms: Mapped[int | None] = mapped_column(
         Integer,
         nullable=True,
+    )
+
+
+class AssetAccessGrant(Base):
+    """记录用户可以读取的资产范围。"""
+
+    __tablename__ = "asset_access_grants"
+
+    user_id: Mapped[str] = mapped_column(
+        String(100),
+        primary_key=True,
+    )
+    asset_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        server_default=func.now(),
     )

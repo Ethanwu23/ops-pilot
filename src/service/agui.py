@@ -11,19 +11,20 @@ See docs/AGUI.md for usage, including how to connect a client.
 
 import logging
 from collections.abc import AsyncGenerator
-from typing import Any
-from uuid import uuid4
+from typing import Annotated, Any
 
 from ag_ui.core import EventType, RunAgentInput
 from ag_ui.encoder import EventEncoder
 from ag_ui_langgraph import LangGraphAgent
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from langchain_core.runnables import RunnableConfig
 from langfuse.langchain import CallbackHandler  # type: ignore[import-untyped]
 
 from agents import DEFAULT_AGENT, AgentGraph, get_agent
 from core import settings
+from schema.auth import AuthenticatedUser
+from service.auth import get_authenticated_user
 from service.utils import ensure_model_available
 
 logger = logging.getLogger(__name__)
@@ -32,16 +33,24 @@ router = APIRouter(prefix="/agui")
 
 # Managed by the protocol (thread_id comes from RunAgentInput) or the checkpointer,
 # so clients may not override them via forwardedProps.configurable.
-RESERVED_CONFIGURABLE_KEYS = {"thread_id", "checkpoint_id", "checkpoint_ns"}
+RESERVED_CONFIGURABLE_KEYS = {
+    "thread_id",
+    "checkpoint_id",
+    "checkpoint_ns",
+    "user_id",
+}
 
 
-def _base_config(input_data: RunAgentInput, agent_id: str) -> RunnableConfig:
+def _base_config(
+    input_data: RunAgentInput,
+    agent_id: str,
+    user_id: str,
+) -> RunnableConfig:
     """Build the base RunnableConfig for an AG-UI run.
 
-    Clients can pass configurable values (e.g. `model`, `user_id`, or custom agent
-    config) in `forwardedProps.configurable` - the AG-UI equivalent of the vanilla
-    API's `model` / `user_id` / `agent_config` fields. `thread_id` is taken from
-    the AG-UI input by the `ag-ui-langgraph` package itself.
+    Clients can pass model and custom agent configuration in
+    `forwardedProps.configurable`. User identity comes from the verified JWT, and
+    `thread_id` is taken from the AG-UI input by `ag-ui-langgraph`.
     """
     forwarded: dict[str, Any] = input_data.forwarded_props or {}
     configurable = forwarded.get("configurable") or {}
@@ -61,7 +70,7 @@ def _base_config(input_data: RunAgentInput, agent_id: str) -> RunnableConfig:
         callbacks.append(CallbackHandler())
 
     configurable = dict(configurable)
-    user_id = configurable.setdefault("user_id", str(uuid4()))
+    configurable["user_id"] = user_id
 
     return RunnableConfig(
         configurable=configurable,
@@ -94,7 +103,13 @@ async def _event_stream(
 @router.post("/run", operation_id="agui_run_default")
 @router.post("/{agent_id}/run", operation_id="agui_run")
 async def agui_run(
-    input_data: RunAgentInput, request: Request, agent_id: str = DEFAULT_AGENT
+    input_data: RunAgentInput,
+    request: Request,
+    current_user: Annotated[
+        AuthenticatedUser,
+        Depends(get_authenticated_user),
+    ],
+    agent_id: str = DEFAULT_AGENT,
 ) -> StreamingResponse:
     """
     Run an agent over the AG-UI protocol, streaming AG-UI events via SSE.
@@ -108,7 +123,21 @@ async def agui_run(
     except KeyError:
         raise HTTPException(status_code=404, detail=f"Agent {agent_id} not found")
 
-    config = _base_config(input_data, agent_id)
+    checkpointer = getattr(graph, "checkpointer", None)
+    if checkpointer is not None:
+        checkpoint_tuple = await checkpointer.aget_tuple(
+            RunnableConfig(configurable={"thread_id": input_data.thread_id})
+        )
+        if checkpoint_tuple is not None and (
+            checkpoint_tuple.metadata.get("user_id") != current_user.user_id
+            or checkpoint_tuple.metadata.get("agent_id") != agent_id
+        ):
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found",
+            )
+
+    config = _base_config(input_data, agent_id, current_user.user_id)
     encoder = EventEncoder(accept=request.headers.get("accept", ""))
     return StreamingResponse(
         _event_stream(agent_id, graph, input_data, config, encoder),

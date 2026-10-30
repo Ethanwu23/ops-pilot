@@ -56,11 +56,6 @@ class UserInput(BaseModel):
         default=None,
         examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
     )
-    user_id: str | None = Field(
-        description="User ID to persist and continue a conversation across multiple threads.",
-        default=None,
-        examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
-    )
     agent_config: dict[str, Any] = Field(
         description="Additional configuration to pass through to the agent",
         default={},
@@ -177,12 +172,8 @@ class ChatHistory(BaseModel):
 
 
 class UserThreadsInput(BaseModel):
-    """Input for listing a user's conversation threads."""
+    """当前认证用户的会话列表查询参数。"""
 
-    user_id: str = Field(
-        description="User ID to list threads for.",
-        examples=["847c6285-8fc9-4560-a83f-4e6285809254"],
-    )
     limit: int = Field(
         description="Maximum number of threads to return.",
         default=20,
