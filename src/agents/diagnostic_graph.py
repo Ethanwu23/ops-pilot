@@ -7,6 +7,7 @@ from agents.diagnostic_nodes import (
     finish_analysis,
     finish_direct,
     finish_failure,
+    pause_before_analysis,
     prepare_evidence,
     request_model,
     route_after_analysis,
@@ -24,6 +25,7 @@ builder.add_node("start_diagnosis", start_diagnosis)
 builder.add_node("request_model", request_model)
 builder.add_node("execute_tools", execute_tools)
 builder.add_node("prepare_evidence", prepare_evidence)
+builder.add_node("pause_before_analysis", pause_before_analysis)
 builder.add_node("analyze_evidence", analyze_evidence)
 builder.add_node("finish_analysis", finish_analysis)
 builder.add_node("finish_direct", finish_direct)
@@ -58,10 +60,12 @@ builder.add_conditional_edges(
     "prepare_evidence",
     route_after_evidence,
     {
-        "analyze": "analyze_evidence",
+        "analyze": "pause_before_analysis",
         "failure": "finish_failure",
     },
 )
+
+builder.add_edge("pause_before_analysis", "analyze_evidence")
 
 builder.add_conditional_edges(
     "analyze_evidence",

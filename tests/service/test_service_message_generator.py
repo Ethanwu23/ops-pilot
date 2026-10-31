@@ -1,5 +1,6 @@
 import json
 from unittest.mock import patch
+from uuid import uuid4
 
 import pytest
 from langchain_core.language_models import FakeMessagesListChatModel
@@ -49,13 +50,17 @@ async def test_three_layer_supervisor_hierarchy_agent_with_fake_model():
     with patch("service.service.get_agent", return_value=agent):
         from service.service import message_generator
 
+        user_input = StreamInput(message="Add 2 and 3")
+        run_id = uuid4()
+        kwargs = {
+            "input": {"messages": [("human", user_input.message)]},
+            "config": {"configurable": {"thread_id": str(uuid4()), "diagnosis_run_id": run_id}},
+        }
         messages = []
-        async for chunk in message_generator(
-            StreamInput(message="Add 2 and 3"), agent_id="langgraph-supervisor-hierarchy-agent"
-        ):
-            if chunk and chunk.strip() != "data: [DONE]":  # Skip [DONE] message
-                chat_message = json.loads(chunk.lstrip("data: "))["content"]
-                messages.append(ChatMessage.model_validate(chat_message))
+        async for chunk in message_generator(user_input, agent, kwargs, run_id):
+            event = json.loads(chunk.removeprefix("data: "))
+            if event["type"] == "message":
+                messages.append(ChatMessage.model_validate(event["content"]))
 
         for msg in messages:
             print(msg)

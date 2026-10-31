@@ -171,17 +171,19 @@ class AgentClient:
 
         return ChatMessage.model_validate(response.json())
 
-    def _parse_stream_line(self, line: str) -> ChatMessage | str | None:
+    def _parse_stream_line(
+        self, line: str,
+    ) -> ChatMessage | str | dict[str, Any] | None:
         line = line.strip()
         if line.startswith("data: "):
             data = line[6:]
-            if data == "[DONE]":
-                return None
             try:
                 parsed = json.loads(data)
             except Exception as e:
                 raise Exception(f"Error JSON parsing message from server: {e}")
             match parsed["type"]:
+                case "progress" | "interrupt" | "done":
+                    return parsed
                 case "message":
                     # Convert the JSON formatted message to an AnyMessage
                     try:
@@ -244,7 +246,18 @@ class AgentClient:
                     if line.strip():
                         parsed = self._parse_stream_line(line)
                         if parsed is None:
-                            break
+                            continue
+                        if isinstance(parsed, dict):
+                            if parsed["type"] == "done":
+                                break
+                            if parsed["type"] == "interrupt":
+                                yield ChatMessage(
+                                    type="ai",
+                                    content=parsed["content"],
+                                    run_id=parsed["run_id"],
+                                    custom_data=parsed,
+                                )
+                            continue
                         yield parsed
         except httpx.HTTPError as e:
             raise AgentClientError(f"Error: {e}")
@@ -298,8 +311,19 @@ class AgentClient:
                         if line.strip():
                             parsed = self._parse_stream_line(line)
                             if parsed is None:
-                                break
-                            # Don't yield empty string tokens as they cause generator issues
+                                continue
+                            if isinstance(parsed, dict):
+                                if parsed["type"] == "done":
+                                    break
+                                if parsed["type"] == "interrupt":
+                                    yield ChatMessage(
+                                        type="ai",
+                                        content=parsed["content"],
+                                        run_id=parsed["run_id"],
+                                        custom_data=parsed,
+                                    )
+                                continue
+                            # 空文本片段不交给调用方。
                             if parsed != "":
                                 yield parsed
             except httpx.HTTPError as e:

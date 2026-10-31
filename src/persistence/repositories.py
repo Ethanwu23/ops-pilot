@@ -1,7 +1,7 @@
 from typing import Any
 from uuid import UUID
 
-from sqlalchemy import Integer, cast, func, update
+from sqlalchemy import Integer, cast, func, select, update
 
 from persistence.database import BusinessSessionFactory
 from persistence.models import DiagnosisRun, ToolExecutionLog
@@ -33,19 +33,48 @@ async def create_diagnosis_run(
     return diagnosis_run_id
 
 
+async def get_diagnosis_status(
+    session_factory: BusinessSessionFactory,
+    *,
+    diagnosis_run_id: UUID,
+    user_id: str,
+    thread_id: str,
+) -> str | None:
+    """查询指定用户和会话下的诊断状态，不存在时返回 None。"""
+    statement = select(DiagnosisRun.status).where(
+        DiagnosisRun.id == diagnosis_run_id,
+        DiagnosisRun.user_id == user_id,
+        DiagnosisRun.thread_id == thread_id,
+    )
+
+    async with session_factory() as session:
+        async with session.begin():
+            diagnosis_status = await session.scalar(statement)
+
+    return diagnosis_status
+
+
 async def mark_diagnosis_succeeded(
     session_factory: BusinessSessionFactory,
     *,
     diagnosis_run_id: UUID,
     result_summary: str,
-    duration_ms: int,
 ) -> None:
-    """把运行中的诊断记录更新为成功状态。"""
-    if duration_ms < 0:
-        raise ValueError("duration_ms 不能小于 0")
-
+    """把运行中的诊断记录更新为成功，并使用数据库时间计算总耗时。"""
     async with session_factory() as session:
         async with session.begin():
+            diagnosis_duration_ms = func.greatest(
+                0,
+                cast(
+                    func.extract(
+                        "epoch",
+                        func.now() - DiagnosisRun.started_at,
+                    )
+                    * 1000,
+                    Integer,
+                ),
+            )
+
             statement = (
                 update(DiagnosisRun)
                 .where(
@@ -57,7 +86,7 @@ async def mark_diagnosis_succeeded(
                     result_summary=result_summary,
                     error_message=None,
                     finished_at=func.now(),
-                    duration_ms=duration_ms,
+                    duration_ms=diagnosis_duration_ms,
                 )
                 .returning(DiagnosisRun.id)
             )
@@ -73,17 +102,25 @@ async def mark_diagnosis_failed(
     *,
     diagnosis_run_id: UUID,
     error_message: str,
-    duration_ms: int,
 ) -> None:
-    """把运行中的诊断记录更新为失败状态。"""
+    """把运行中的诊断记录更新为失败，并使用数据库时间计算总耗时。"""
     if not error_message:
         raise ValueError("error_message 不能为空")
 
-    if duration_ms < 0:
-        raise ValueError("duration_ms 不能小于 0")
-
     async with session_factory() as session:
         async with session.begin():
+            diagnosis_duration_ms = func.greatest(
+                0,
+                cast(
+                    func.extract(
+                        "epoch",
+                        func.now() - DiagnosisRun.started_at,
+                    )
+                    * 1000,
+                    Integer,
+                ),
+            )
+
             statement = (
                 update(DiagnosisRun)
                 .where(
@@ -95,7 +132,7 @@ async def mark_diagnosis_failed(
                     result_summary=None,
                     error_message=error_message,
                     finished_at=func.now(),
-                    duration_ms=duration_ms,
+                    duration_ms=diagnosis_duration_ms,
                 )
                 .returning(DiagnosisRun.id)
             )

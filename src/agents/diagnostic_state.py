@@ -1,4 +1,3 @@
-from time import perf_counter
 from typing import Literal
 from uuid import UUID
 
@@ -19,7 +18,6 @@ class DiagnosticState(MessagesState, total=False):
     evidence: list[Evidence]
     analysis: AnalysisResult | None
     diagnosis_run_id: UUID
-    started_at_monotonic: float
 
 
 async def start_diagnosis(
@@ -27,8 +25,6 @@ async def start_diagnosis(
     config: RunnableConfig,
 ) -> DiagnosticState:
     """创建业务诊断记录，并初始化本轮工作流状态。"""
-    started_at_monotonic = perf_counter()
-
     user_message = next(
         (message for message in reversed(state["messages"]) if isinstance(message, HumanMessage)),
         None,
@@ -69,5 +65,4 @@ async def start_diagnosis(
         "evidence": [],
         "analysis": None,
         "diagnosis_run_id": diagnosis_run_id,
-        "started_at_monotonic": started_at_monotonic,
     }

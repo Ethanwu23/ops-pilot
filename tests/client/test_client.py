@@ -121,19 +121,33 @@ async def test_ainvoke(agent_client):
         assert "500 Internal Server Error" in str(exc.value)
 
 
-def test_stream(agent_client):
+@pytest.mark.parametrize("terminal_status", ["succeeded", "paused"])
+def test_stream(agent_client, terminal_status):
     """Test synchronous streaming."""
     QUESTION = "What is the weather?"
     TOKENS = ["The", " weather", " is", " sunny", "."]
     FINAL_ANSWER = "The weather is sunny."
 
     # Create mock response with streaming events
+    final_event = (
+        {
+            "type": "interrupt",
+            "content": FINAL_ANSWER,
+            "interrupt_id": "pause-1",
+            "thread_id": "thread-1",
+            "diagnosis_run_id": "diagnosis-1",
+            "run_id": "request-1",
+        }
+        if terminal_status == "paused"
+        else {"type": "message", "content": {"type": "ai", "content": FINAL_ANSWER}}
+    )
+    # 进度和心跳不能提前结束读取；done 后的数据不能继续交付。
     events = (
-        [f"data: {json.dumps({'type': 'token', 'content': token})}" for token in TOKENS]
-        + [
-            f"data: {json.dumps({'type': 'message', 'content': {'type': 'ai', 'content': FINAL_ANSWER}})}"
-        ]
-        + ["data: [DONE]"]
+        [': heartbeat', 'data: {"type": "progress", "stage": "started"}']
+        + [f"data: {json.dumps({'type': 'token', 'content': token})}" for token in TOKENS]
+        + [f"data: {json.dumps(final_event)}"]
+        + [f"data: {json.dumps({'type': 'done', 'status': terminal_status})}"]
+        + ['data: {"type": "token", "content": "不应读取"}']
     )
 
     # Mock the streaming response
@@ -158,6 +172,10 @@ def test_stream(agent_client):
         assert isinstance(final_message, ChatMessage)
         assert final_message.type == "ai"
         assert final_message.content == FINAL_ANSWER
+        if terminal_status == "paused":
+            assert final_message.custom_data["interrupt_id"] == "pause-1"
+            assert final_message.custom_data["diagnosis_run_id"] == "diagnosis-1"
+            assert final_message.run_id == "request-1"
 
     # Test error response
     error_response = Response(
@@ -173,19 +191,33 @@ def test_stream(agent_client):
 
 
 @pytest.mark.asyncio
-async def test_astream(agent_client):
+@pytest.mark.parametrize("terminal_status", ["succeeded", "paused"])
+async def test_astream(agent_client, terminal_status):
     """Test asynchronous streaming."""
     QUESTION = "What is the weather?"
     TOKENS = ["The", " weather", " is", " sunny", "."]
     FINAL_ANSWER = "The weather is sunny."
 
     # Create mock response with streaming events
+    final_event = (
+        {
+            "type": "interrupt",
+            "content": FINAL_ANSWER,
+            "interrupt_id": "pause-1",
+            "thread_id": "thread-1",
+            "diagnosis_run_id": "diagnosis-1",
+            "run_id": "request-1",
+        }
+        if terminal_status == "paused"
+        else {"type": "message", "content": {"type": "ai", "content": FINAL_ANSWER}}
+    )
+    # 进度和心跳不能提前结束读取；done 后的数据不能继续交付。
     events = (
-        [f"data: {json.dumps({'type': 'token', 'content': token})}" for token in TOKENS]
-        + [
-            f"data: {json.dumps({'type': 'message', 'content': {'type': 'ai', 'content': FINAL_ANSWER}})}"
-        ]
-        + ["data: [DONE]"]
+        [': heartbeat', 'data: {"type": "progress", "stage": "started"}']
+        + [f"data: {json.dumps({'type': 'token', 'content': token})}" for token in TOKENS]
+        + [f"data: {json.dumps(final_event)}"]
+        + [f"data: {json.dumps({'type': 'done', 'status': terminal_status})}"]
+        + ['data: {"type": "token", "content": "不应读取"}']
     )
 
     # Create an async iterator for the events
@@ -221,6 +253,10 @@ async def test_astream(agent_client):
         assert isinstance(final_message, ChatMessage)
         assert final_message.type == "ai"
         assert final_message.content == FINAL_ANSWER
+        if terminal_status == "paused":
+            assert final_message.custom_data["interrupt_id"] == "pause-1"
+            assert final_message.custom_data["diagnosis_run_id"] == "diagnosis-1"
+            assert final_message.run_id == "request-1"
 
     # Test error response
     error_response = Response(

@@ -1,4 +1,5 @@
 import json
+import logging
 from time import perf_counter
 from typing import Literal
 from uuid import UUID
@@ -14,6 +15,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.prebuilt import ToolNode
 from langgraph.prebuilt.tool_node import ToolInvocationError
 from langgraph.runtime import get_runtime
+from langgraph.types import interrupt
 from openai import OpenAIError
 from psycopg import Error as PsycopgError
 from pydantic import ValidationError
@@ -34,7 +36,24 @@ from persistence.repositories import (
 )
 from schema.diagnosis import AnalysisResult
 
+logger = logging.getLogger(__name__)
+
 tools = [get_asset, get_metrics]
+
+
+def pause_before_analysis(
+    state: DiagnosticState,
+) -> DiagnosticState:
+    """在证据校验后暂停，收到明确恢复值后继续分析。"""
+    resume_value = interrupt(
+        "证据已准备，工作流暂停；发送 continue 继续分析。"
+    )
+
+    # 恢复值必须严格匹配，避免意外继续。
+    if resume_value != "continue":
+        raise ValueError("暂停工作流，未收到继续命令")
+
+    return {}
 
 
 def get_diagnosis_run_id(state: DiagnosticState) -> UUID:
@@ -45,22 +64,6 @@ def get_diagnosis_run_id(state: DiagnosticState) -> UUID:
         raise ValueError("缺少有效的诊断记录 ID")
 
     return diagnosis_run_id
-
-
-def get_run_completion(state: DiagnosticState) -> tuple[UUID, int]:
-    """取得诊断记录 ID，并计算本轮执行耗时。"""
-    diagnosis_run_id = get_diagnosis_run_id(state)
-
-    started_at_monotonic = state.get("started_at_monotonic")
-    if not isinstance(started_at_monotonic, float):
-        raise ValueError("缺少有效的诊断开始时间")
-
-    duration_ms = max(
-        0,
-        int((perf_counter() - started_at_monotonic) * 1000),
-    )
-
-    return diagnosis_run_id, duration_ms
 
 
 async def request_model(
@@ -302,7 +305,11 @@ async def analyze_evidence(
 
     # 从后向前查找本轮用户问题，不重复使用历史工具证据。
     user_message = next(
-        (message for message in reversed(state["messages"]) if isinstance(message, HumanMessage)),
+        (
+            message
+            for message in reversed(state["messages"])
+            if isinstance(message, HumanMessage)
+        ),
         None,
     )
     if user_message is None:
@@ -310,7 +317,10 @@ async def analyze_evidence(
 
     payload = {
         "question": user_message.content,
-        "evidence": [item.model_dump(mode="json") for item in evidence],
+        "evidence": [
+            item.model_dump(mode="json")
+            for item in evidence
+        ],
     }
 
     instructions = (
@@ -324,7 +334,9 @@ async def analyze_evidence(
         "摘要说明结论与限制，不重新罗列日期、IP、指标等原始字段。"
     )
 
-    model = get_model(config["configurable"].get("model", settings.DEFAULT_MODEL))
+    model = get_model(
+        config["configurable"].get("model", settings.DEFAULT_MODEL)
+    )
     structured_model = model.with_structured_output(
         AnalysisResult,
         method="function_calling",
@@ -343,15 +355,25 @@ async def analyze_evidence(
         )
 
         if not isinstance(analysis, AnalysisResult):
+            logger.error(
+                "模型分析返回类型不符合要求：actual_type=%s",
+                type(analysis).__name__,
+            )
             raise TypeError("模型分析结果必须是 AnalysisResult")
 
         if not analysis.summary.strip():
             raise ValueError("分析摘要不能为空白")
 
-        if any(not item.strip() for item in analysis.missing_information):
+        if any(
+            not item.strip()
+            for item in analysis.missing_information
+        ):
             raise ValueError("缺失信息条目不能为空白")
 
-        valid_ids = {item.evidence_id for item in evidence}
+        valid_ids = {
+            item.evidence_id
+            for item in evidence
+        }
 
         for hypothesis in analysis.hypotheses:
             if not hypothesis.statement.strip():
@@ -362,19 +384,30 @@ async def analyze_evidence(
 
             for evidence_id in hypothesis.evidence_ids:
                 if evidence_id not in valid_ids:
-                    raise ValueError(f"推测引用了不存在的本轮证据：{evidence_id}")
+                    raise ValueError(
+                        f"推测引用了不存在的本轮证据：{evidence_id}"
+                    )
 
-    except OpenAIError:
+    except OpenAIError as exc:
+        logger.error(
+            "模型分析调用失败：error_type=%s",
+            type(exc).__name__,
+        )
         return {
             "analysis": None,
             "error": "模型分析调用失败，未生成诊断结果",
         }
+
     except (
         OutputParserException,
         ValidationError,
         TypeError,
         ValueError,
-    ):
+    ) as exc:
+        logger.error(
+            "模型分析结果校验失败：error_type=%s",
+            type(exc).__name__,
+        )
         return {
             "analysis": None,
             "error": "模型分析结果校验失败，未生成诊断结果",
@@ -384,7 +417,6 @@ async def analyze_evidence(
         "analysis": analysis,
         "error": None,
     }
-
 
 def route_after_analysis(
     state: DiagnosticState,
@@ -422,7 +454,7 @@ async def finish_analysis(
         content=json.dumps(payload, ensure_ascii=False),
     )
 
-    diagnosis_run_id, duration_ms = get_run_completion(state)
+    diagnosis_run_id = get_diagnosis_run_id(state)
     runtime = get_runtime()
 
     await mark_diagnosis_succeeded(
@@ -432,7 +464,6 @@ async def finish_analysis(
             analysis.model_dump(mode="json"),
             ensure_ascii=False,
         ),
-        duration_ms=duration_ms,
     )
 
     return {
@@ -466,7 +497,7 @@ async def finish_direct(
     if not isinstance(message.content, str) or not message.content.strip():
         raise ValueError("普通回答内容必须是非空字符串")
 
-    diagnosis_run_id, duration_ms = get_run_completion(state)
+    diagnosis_run_id = get_diagnosis_run_id(state)
     runtime = get_runtime()
 
     result_summary = {
@@ -481,7 +512,6 @@ async def finish_direct(
             result_summary,
             ensure_ascii=False,
         ),
-        duration_ms=duration_ms,
     )
 
     # 回答已经由模型节点加入消息历史，这里只更新终态。
@@ -500,14 +530,13 @@ async def finish_failure(
     if not isinstance(error, str) or not error.strip():
         raise ValueError("失败收尾必须提供非空白的错误说明")
 
-    diagnosis_run_id, duration_ms = get_run_completion(state)
+    diagnosis_run_id = get_diagnosis_run_id(state)
     runtime = get_runtime()
 
     await mark_diagnosis_failed(
         runtime.context.business_session_factory,
         diagnosis_run_id=diagnosis_run_id,
         error_message=error,
-        duration_ms=duration_ms,
     )
 
     # 错误说明由上游提供，不直接暴露底层异常详情。

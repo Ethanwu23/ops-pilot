@@ -38,7 +38,10 @@ from persistence.database import (
     create_business_engine,
     create_business_session_factory,
 )
-from persistence.repositories import mark_unfinished_execution_failed
+from persistence.repositories import (
+    get_diagnosis_status,
+    mark_unfinished_execution_failed,
+)
 from schema import (
     ChatHistory,
     ChatHistoryInput,
@@ -237,7 +240,32 @@ async def _handle_input(
 
     input: Command | dict[str, Any]
     if interrupted_tasks:
-        # assume user input is response to resume agent execution from interrupt
+        # 恢复沿用图状态中的业务诊断 ID，请求追踪 ID 仍保持本次新值。
+        diagnosis_run_id = state.values.get("diagnosis_run_id")
+        if not isinstance(diagnosis_run_id, UUID):
+            raise HTTPException(
+                status_code=500,
+                detail="中断状态缺少有效的诊断记录 ID",
+            )
+        # 业务已结束时，不允许借助遗留的图中断继续执行。
+        diagnosis_status = await get_diagnosis_status(
+            app.state.business_session_factory,
+            diagnosis_run_id=diagnosis_run_id,
+            user_id=user_id,
+            thread_id=thread_id,
+        )
+        if diagnosis_status is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Conversation not found",
+            )
+        if diagnosis_status != "running":
+            raise HTTPException(
+                status_code=409,
+                detail="诊断已结束，不能恢复，请使用新会话发起诊断",
+            )
+
+        config["configurable"]["diagnosis_run_id"] = diagnosis_run_id
         input = Command(resume=user_input.message)
     else:
         input = {"messages": [HumanMessage(content=user_input.message)]}
@@ -304,29 +332,41 @@ async def invoke(
 
         output.run_id = str(run_id)
         return output
-    except Exception as e:
-        logger.error(f"An exception occurred: {e}")
-        raise HTTPException(status_code=500, detail="Unexpected error")
+    except asyncio.CancelledError:
+        # 取消时完成业务收尾，然后继续传播取消信号。
+        with anyio.CancelScope(shield=True):
+            try:
+                await mark_unfinished_execution_failed(
+                    app.state.business_session_factory,
+                    diagnosis_run_id=kwargs["config"]["configurable"]["diagnosis_run_id"],
+                    error_message="请求执行已取消",
+                )
+            except Exception:
+                logger.exception("普通请求取消收尾失败：run_id=%s", run_id)
+        raise
+    except Exception as exc:
+        logger.error("普通请求执行异常：run_id=%s error=%s", run_id, exc)
+        # 复用现有短事务，原子收尾诊断和未结束的工具日志。
+        with anyio.CancelScope(shield=True):
+            try:
+                await mark_unfinished_execution_failed(
+                    app.state.business_session_factory,
+                    diagnosis_run_id=kwargs["config"]["configurable"]["diagnosis_run_id"],
+                    error_message="执行发生未处理异常",
+                )
+            except Exception:
+                logger.exception("普通请求异常收尾失败：run_id=%s", run_id)
+        raise HTTPException(status_code=500, detail="Unexpected error") from exc
 
 
 async def message_generator(
     user_input: StreamInput,
-    current_user: AuthenticatedUser,
-    agent_id: str = DEFAULT_AGENT,
+    agent: AgentGraph,
+    kwargs: dict[str, Any],
+    run_id: UUID,
 ) -> AsyncGenerator[str, None]:
-    """
-    Generate a stream of messages from the agent.
-
-    This is the workhorse method for the /stream endpoint.
-    """
-    agent: AgentGraph = get_agent(agent_id)
-    kwargs, run_id = await _handle_input(
-        user_input,
-        agent,
-        agent_id,
-        current_user,
-    )
-    terminal_status: Literal["succeeded", "failed"] | None = None
+    """使用已校验的执行参数运行工作流，并输出 SSE 事件。"""
+    terminal_status: Literal["succeeded", "failed", "paused"] | None = None
 
     try:
         # Process streamed events from the graph and yield messages over the SSE stream.
@@ -345,13 +385,31 @@ async def message_generator(
             new_messages: list[Any] = []
             if stream_mode == "updates":
                 for node, updates in event.items():
-                    # A simple approach to handle agent interrupts.
-                    # In a more sophisticated implementation, we could add
-                    # some structured ChatMessage type to return the interrupt value.
+                    # 暂停正常结束本次流，业务诊断仍等待恢复。
                     if node == "__interrupt__":
+                        if not updates:
+                            raise ValueError("中断事件缺少中断信息")
+
+                        terminal_status = "paused"
                         interrupt: Interrupt
                         for interrupt in updates:
-                            new_messages.append(AIMessage(content=interrupt.value))
+                            yield (
+                                "data: "
+                                + json.dumps(
+                                    {
+                                        "type": "interrupt",
+                                        "content": interrupt.value,
+                                        "interrupt_id": interrupt.id,
+                                        "thread_id": kwargs["config"]["configurable"]["thread_id"],
+                                        "diagnosis_run_id": str(
+                                            kwargs["config"]["configurable"]["diagnosis_run_id"]
+                                        ),
+                                        "run_id": str(run_id),
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n\n"
+                            )
                         continue
                     progress = PROGRESS_BY_NODE.get(node)
                     if progress is not None:
@@ -444,7 +502,7 @@ async def message_generator(
                     yield f"data: {json.dumps({'type': 'token', 'content': convert_message_content_to_string(content)})}\n\n"
 
         if terminal_status is None:
-            raise RuntimeError("工作流结束但没有产生业务终态")
+            raise RuntimeError("工作流结束但没有产生业务终态或中断")
 
         yield (
             "data: "
@@ -469,7 +527,7 @@ async def message_generator(
             try:
                 await mark_unfinished_execution_failed(
                     app.state.business_session_factory,
-                    diagnosis_run_id=run_id,
+                    diagnosis_run_id=kwargs["config"]["configurable"]["diagnosis_run_id"],
                     error_message="客户端断开，执行已取消",
                 )
             except Exception:
@@ -490,7 +548,7 @@ async def message_generator(
             try:
                 await mark_unfinished_execution_failed(
                     app.state.business_session_factory,
-                    diagnosis_run_id=run_id,
+                    diagnosis_run_id=kwargs["config"]["configurable"]["diagnosis_run_id"],
                     error_message="执行发生未处理异常",
                 )
             except Exception:
@@ -576,8 +634,16 @@ async def stream(
 
     Set `stream_tokens=false` to return intermediate messages but not token-by-token.
     """
+    # 在响应开始前完成授权及恢复检查，使入口错误保留 HTTP 状态码。
+    agent = get_agent(agent_id)
+    kwargs, run_id = await _handle_input(
+        user_input,
+        agent,
+        agent_id,
+        current_user,
+    )
     return StreamingResponse(
-        message_generator(user_input, current_user, agent_id),
+        message_generator(user_input, agent, kwargs, run_id),
         media_type="text/event-stream",
     )
 
