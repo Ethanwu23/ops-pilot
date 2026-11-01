@@ -1,3 +1,4 @@
+import asyncio
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -12,12 +13,26 @@ from service.auth import get_authenticated_user
 
 @pytest.fixture
 def test_client():
-    """Fixture to create a FastAPI test client."""
-    app.dependency_overrides[get_authenticated_user] = lambda: AuthenticatedUser(user_id="user-123")
-    try:
-        yield TestClient(app)
-    finally:
-        app.dependency_overrides.clear()
+    """提供隔离身份和共享资源替身，不启动真实依赖。"""
+    with (
+        patch.dict(
+            app.state._state,
+            {
+                "metrics_client": Mock(),
+                "metrics_semaphore": asyncio.Semaphore(2),
+                "business_session_factory": Mock(),
+            },
+        ),
+        patch.dict(
+            app.dependency_overrides,
+            {get_authenticated_user: lambda: AuthenticatedUser(user_id="user-123")},
+        ),
+    ):
+        client = TestClient(app)
+        try:
+            yield client
+        finally:
+            client.close()
 
 
 @pytest.fixture

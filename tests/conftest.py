@@ -10,8 +10,15 @@ def pytest_addoption(parser):
     )
 
 
+    parser.addoption(
+        "--run-postgres", action="store_true", default=False,
+        help="run isolated PostgreSQL integration tests",
+    )
+
+
 def pytest_configure(config):
     config.addinivalue_line("markers", "docker: mark test as requiring docker containers")
+    config.addinivalue_line("markers", "postgres: requires explicit isolated test database")
 
 
 def pytest_collection_modifyitems(config, items):
@@ -20,6 +27,10 @@ def pytest_collection_modifyitems(config, items):
         for item in items:
             if "docker" in item.keywords:
                 item.add_marker(skip_docker)
+    if not config.getoption("--run-postgres"):
+        for item in items:
+            if "postgres" in item.keywords:
+                item.add_marker(pytest.mark.skip(reason="need --run-postgres option to run"))
 
 
 @pytest.fixture

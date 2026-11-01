@@ -1,5 +1,7 @@
 import json
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+from uuid import uuid4
 
 import langsmith
 import pytest
@@ -206,6 +208,13 @@ def test_history(test_client, mock_agent) -> None:
         interrupts=(),
     )
 
+    mock_agent.checkpointer = SimpleNamespace(
+        aget_tuple=AsyncMock(return_value=SimpleNamespace(
+            metadata={"user_id": "user-123", "agent_id": "chatbot"},
+            checkpoint={"channel_values": {}},
+        )),
+    )
+
     response = test_client.post(
         "/history", json={"thread_id": "7bcc7cc1-99d7-4b1d-bdb5-e6f90ed44de6"}
     )
@@ -248,7 +257,12 @@ def test_history_custom_agent(test_client) -> None:
 
     custom_mock = AsyncMock()
     custom_mock.aget_state.return_value = custom_snapshot
-    custom_mock.checkpointer = None
+    custom_mock.checkpointer = SimpleNamespace(
+        aget_tuple=AsyncMock(return_value=SimpleNamespace(
+            metadata={"user_id": "user-123", "agent_id": CUSTOM_AGENT},
+            checkpoint={"channel_values": {}},
+        )),
+    )
     default_mock = AsyncMock()
     default_mock.aget_state.return_value = default_snapshot
     default_mock.checkpointer = None
@@ -296,7 +310,12 @@ async def test_stream(test_client, mock_agent) -> None:
     ] + [
         (
             "updates",
-            {"chat_model": {"messages": [AIMessage(content=FINAL_ANSWER)]}},
+            {
+                "finish_direct": {
+                    "messages": [AIMessage(content=FINAL_ANSWER)],
+                    "status": "succeeded",
+                }
+            },
         )
     ]
 
@@ -315,8 +334,8 @@ async def test_stream(test_client, mock_agent) -> None:
         # Collect all SSE messages
         messages = []
         for line in response.iter_lines():
-            if line and line.strip() != "data: [DONE]":  # Skip [DONE] message
-                messages.append(json.loads(line.lstrip("data: ")))
+            if line.startswith("data: "):
+                messages.append(json.loads(line.removeprefix("data: ")))
 
         # Verify streamed tokens
         token_messages = [msg for msg in messages if msg["type"] == "token"]
@@ -329,6 +348,9 @@ async def test_stream(test_client, mock_agent) -> None:
         assert len(final_messages) == 1
         assert final_messages[0]["content"]["content"] == FINAL_ANSWER
         assert final_messages[0]["content"]["type"] == "ai"
+        assert not any(event["type"] == "error" for event in messages)
+        assert messages[-1]["type"] == "done"
+        assert messages[-1]["status"] == "succeeded"
 
 
 @pytest.mark.asyncio
@@ -351,7 +373,12 @@ async def test_stream_no_tokens(test_client, mock_agent) -> None:
     ] + [
         (
             "updates",
-            {"chat_model": {"messages": [AIMessage(content=FINAL_ANSWER)]}},
+            {
+                "finish_direct": {
+                    "messages": [AIMessage(content=FINAL_ANSWER)],
+                    "status": "succeeded",
+                }
+            },
         )
     ]
 
@@ -370,18 +397,24 @@ async def test_stream_no_tokens(test_client, mock_agent) -> None:
         # Collect all SSE messages
         messages = []
         for line in response.iter_lines():
-            if line and line.strip() != "data: [DONE]":  # Skip [DONE] message
-                messages.append(json.loads(line.lstrip("data: ")))
+            if line.startswith("data: "):
+                messages.append(json.loads(line.removeprefix("data: ")))
 
         # Verify no token messages
         token_messages = [msg for msg in messages if msg["type"] == "token"]
         assert len(token_messages) == 0
 
         # Verify final message
-        assert len(messages) == 1
-        assert messages[0]["type"] == "message"
-        assert messages[0]["content"]["content"] == FINAL_ANSWER
-        assert messages[0]["content"]["type"] == "ai"
+        final_messages = [
+            event for event in messages
+            if event["type"] == "message"
+        ]
+        assert len(final_messages) == 1
+        assert final_messages[0]["content"]["content"] == FINAL_ANSWER
+        assert final_messages[0]["content"]["type"] == "ai"
+        assert not any(event["type"] == "error" for event in messages)
+        assert messages[-1]["type"] == "done"
+        assert messages[-1]["status"] == "succeeded"
 
 
 def test_stream_interrupt(test_client, mock_agent) -> None:
@@ -407,23 +440,26 @@ def test_stream_interrupt(test_client, mock_agent) -> None:
     ) as response:
         assert response.status_code == 200
 
-        # Collect all SSE messages
-        messages = []
-        for line in response.iter_lines():
-            if line and line.strip() != "data: [DONE]":  # Skip [DONE] message
-                messages.append(json.loads(line.lstrip("data: ")))
-
-        # Verify interrupt message
-        assert len(messages) == 1
-        assert messages[0]["content"]["content"] == INTERRUPT
-        assert messages[0]["content"]["type"] == "ai"
+        # 暂停是独立事件，当前流结束不等于业务成功。
+        messages = [
+            json.loads(line.removeprefix("data: "))
+            for line in response.iter_lines()
+            if line.startswith("data: ")
+        ]
+        assert [event["type"] for event in messages] == ["interrupt", "done"]
+        interrupted, done = messages
+        assert interrupted["content"] == INTERRUPT
+        assert interrupted["interrupt_id"]
+        assert interrupted["thread_id"]
+        assert interrupted["diagnosis_run_id"]
+        assert done["status"] == "paused"
+        assert done["run_id"] == interrupted["run_id"]
 
 
 def test_info(test_client, mock_settings) -> None:
     """Test that /info returns the correct service metadata."""
 
     base_agent = Agent(description="A base agent.", graph_like=None)
-    mock_settings.AUTH_SECRET = None
     mock_settings.DEFAULT_MODEL = OpenAIModelName.GPT_5_NANO
     mock_settings.AVAILABLE_MODELS = {OpenAIModelName.GPT_5_NANO, OpenAIModelName.GPT_5_MINI}
     with patch.dict("agents.agents.agents", {"base-agent": base_agent}, clear=True):
@@ -431,10 +467,86 @@ def test_info(test_client, mock_settings) -> None:
         assert response.status_code == 200
         output = ServiceMetadata.model_validate(response.json())
 
-    assert output.default_agent == "research-assistant"
+    assert output.default_agent == "chatbot"
     assert len(output.agents) == 1
     assert output.agents[0].key == "base-agent"
     assert output.agents[0].description == "A base agent."
 
     assert output.default_model == OpenAIModelName.GPT_5_NANO
     assert output.models == [OpenAIModelName.GPT_5_MINI, OpenAIModelName.GPT_5_NANO]
+
+
+@pytest.mark.parametrize("owner", [None, "other-user", "other-agent"])
+def test_history_rejects_inaccessible_checkpoint(test_client, mock_agent, owner):
+    """历史不存在或归属不匹配时，不得读取图状态。"""
+    checkpoint = None
+    if owner is not None:
+        checkpoint = SimpleNamespace(
+            metadata={
+                "user_id": "other-user" if owner == "other-user" else "user-123",
+                "agent_id": "other-agent" if owner == "other-agent" else "chatbot",
+            },
+            checkpoint={"channel_values": {}},
+        )
+    mock_agent.checkpointer = SimpleNamespace(aget_tuple=AsyncMock(return_value=checkpoint))
+
+    response = test_client.post("/history", json={"thread_id": "private-thread"})
+
+    assert response.status_code == 404
+    assert response.json() == {"detail": "Conversation not found"}
+    mock_agent.aget_state.assert_not_awaited()
+
+
+@pytest.mark.parametrize("path", ["/invoke", "/stream"])
+@pytest.mark.parametrize("business_status, expected_status", [(None, 404), ("failed", 409), ("succeeded", 409)])
+def test_resume_rejects_ended_or_missing_diagnosis(
+    test_client, mock_agent, path, business_status, expected_status,
+):
+    """恢复入口必须在执行工作流和发送 SSE 之前拒绝无效业务状态。"""
+    diagnosis_id = uuid4()
+    mock_agent.aget_state.return_value = SimpleNamespace(
+        tasks=[SimpleNamespace(interrupts=("waiting",))],
+        values={"diagnosis_run_id": diagnosis_id},
+    )
+    with patch("service.service.get_diagnosis_status", new_callable=AsyncMock) as lookup:
+        lookup.return_value = business_status
+        response = test_client.post(path, json={"message": "continue", "thread_id": "paused-thread"})
+
+    assert response.status_code == expected_status
+    assert response.headers["content-type"].startswith("application/json")
+    assert "data: " not in response.text
+    if expected_status == 404:
+        assert response.json() == {"detail": "Conversation not found"}
+    else:
+        assert response.json()["detail"] == "诊断已结束，不能恢复，请使用新会话发起诊断"
+    lookup.assert_awaited_once()
+    assert lookup.await_args.kwargs == {
+        "diagnosis_run_id": diagnosis_id,
+        "user_id": "user-123",
+        "thread_id": "paused-thread",
+    }
+    mock_agent.ainvoke.assert_not_awaited()
+    mock_agent.astream.assert_not_called()
+
+
+def test_stream_without_terminal_status_reports_error(test_client, mock_agent):
+    """回答消息已输出，也不能把缺少业务终态的执行当成成功。"""
+    async def events(**kwargs):
+        yield ("updates", {"request_model": {"messages": [AIMessage(content="已有回答")]}})
+
+    mock_agent.astream = events
+    with patch("service.service.mark_unfinished_execution_failed", new_callable=AsyncMock) as finalize:
+        response = test_client.post("/stream", json={"message": "测试缺失终态", "stream_tokens": False})
+
+    assert response.status_code == 200
+    frames = [
+        json.loads(line.removeprefix("data: "))
+        for line in response.iter_lines()
+        if line.startswith("data: ")
+    ]
+    assert any(frame["type"] == "message" for frame in frames)
+    assert frames[-2]["type"] == "error"
+    assert frames[-1]["type"] == "done"
+    assert frames[-1]["status"] == "error"
+    finalize.assert_awaited_once()
+    assert str(finalize.await_args.kwargs["diagnosis_run_id"]) == frames[-1]["run_id"]
