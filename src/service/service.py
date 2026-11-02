@@ -33,6 +33,7 @@ from langsmith import uuid7
 from agents import DEFAULT_AGENT, AgentGraph, get_agent, get_all_agent_info, load_agent
 from agents.context import AgentContext
 from core import settings
+from core.observability import DiagnosisTracer, create_tracing_client
 from memory import initialize_database, initialize_store
 from persistence.database import (
     create_business_engine,
@@ -100,6 +101,8 @@ def custom_generate_unique_id(route: APIRoute) -> str:
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     """初始化并清理服务进程共享的资源。"""
+    tracing_client = create_tracing_client()
+    app.state.tracing_client = tracing_client
     business_engine = create_business_engine()
     business_session_factory = create_business_session_factory(business_engine)
 
@@ -144,7 +147,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         logger.error(f"Error during database/store/agents initialization: {exc}")
         raise
     finally:
-        await business_engine.dispose()
+        try:
+            await business_engine.dispose()
+        finally:
+            if tracing_client is not None:
+                await asyncio.to_thread(tracing_client.close, timeout=5.0)
 
 
 app = FastAPI(lifespan=lifespan, generate_unique_id_function=custom_generate_unique_id)
@@ -165,6 +172,28 @@ async def info() -> ServiceMetadata:
         default_agent=DEFAULT_AGENT,
         default_model=settings.DEFAULT_MODEL,
     )
+
+
+async def record_trace_status(kwargs: dict[str, Any], business_status: str) -> None:
+    """追踪不是业务事务；上传失败只记录告警，不改变诊断结果。"""
+    if not settings.LANGSMITH_TRACING:
+        return
+    try:
+        project = await asyncio.to_thread(
+            app.state.tracing_client.read_project,
+            project_name=settings.LANGSMITH_PROJECT,
+        )
+        await asyncio.to_thread(
+            app.state.tracing_client.create_feedback,
+            kwargs["config"]["run_id"],
+            key="business_status",
+            value=business_status,
+            session_id=project.id,
+            trace_id=kwargs["config"]["run_id"],
+            stop_after_attempt=1,
+        )
+    except Exception as exc:
+        logger.warning("追踪状态上传失败：error_type=%s", type(exc).__name__)
 
 
 async def _handle_input(
@@ -270,6 +299,19 @@ async def _handle_input(
     else:
         input = {"messages": [HumanMessage(content=user_input.message)]}
 
+    config["metadata"].update({
+        "thread_id": thread_id,
+        "request_run_id": str(run_id),
+        "diagnosis_run_id": str(configurable["diagnosis_run_id"]),
+        "request_mode": "resume" if interrupted_tasks else "new",
+    })
+    config["run_name"] = f"{agent_id}.diagnosis"
+    if settings.LANGSMITH_TRACING:
+        config["callbacks"].append(DiagnosisTracer(
+            client=app.state.tracing_client,
+            project_name=settings.LANGSMITH_PROJECT,
+        ))
+
     kwargs = {
         "input": input,
         "config": config,
@@ -344,8 +386,13 @@ async def invoke(
             kwargs["config"]["configurable"]["diagnosis_run_id"],
             "paused" if "__interrupt__" in response else response.get("status"),
         )
+        await record_trace_status(
+            kwargs, "paused" if "__interrupt__" in response else response.get("status", "unknown")
+        )
         return output
     except asyncio.CancelledError:
+        with anyio.CancelScope(shield=True):
+            await record_trace_status(kwargs, "cancelled")
         # 取消时完成业务收尾，然后继续传播取消信号。
         with anyio.CancelScope(shield=True):
             try:
@@ -358,6 +405,7 @@ async def invoke(
                 logger.exception("普通请求取消收尾失败：run_id=%s", run_id)
         raise
     except Exception as exc:
+        await record_trace_status(kwargs, "error")
         logger.error(
             "普通请求执行异常：run_id=%s diagnosis_run_id=%s error_type=%s",
             run_id, kwargs["config"]["configurable"]["diagnosis_run_id"], type(exc).__name__,
@@ -520,6 +568,7 @@ async def message_generator(
         if terminal_status is None:
             raise RuntimeError("工作流结束但没有产生业务终态或中断")
 
+        await record_trace_status(kwargs, terminal_status)
         logger.info(
             "流式执行结束：run_id=%s diagnosis_run_id=%s status=%s",
             run_id,
@@ -539,6 +588,8 @@ async def message_generator(
             + "\n\n"
         )
     except asyncio.CancelledError:
+        with anyio.CancelScope(shield=True):
+            await record_trace_status(kwargs, "cancelled")
         logger.info(
             "SSE client disconnected or stream task was cancelled: run_id=%s",
             run_id,
@@ -559,6 +610,7 @@ async def message_generator(
                 )
         raise
     except Exception as exc:
+        await record_trace_status(kwargs, "error")
         logger.error(
             "流式执行异常：run_id=%s diagnosis_run_id=%s error_type=%s",
             run_id,

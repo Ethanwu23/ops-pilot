@@ -114,12 +114,16 @@ class Settings(BaseSettings):
     GITHUB_PAT: SecretStr | None = None
     MCP_GITHUB_SERVER_URL: str = "https://api.githubcopilot.com/mcp/"
 
-    LANGCHAIN_TRACING_V2: bool = False
-    LANGCHAIN_PROJECT: str = "default"
-    LANGCHAIN_ENDPOINT: Annotated[str, BeforeValidator(check_str_is_http)] = (
+    # 追踪默认关闭，默认不上传请求正文和工具结果。
+    LANGSMITH_TRACING: bool = False
+    LANGSMITH_PROJECT: str = Field(default="ops-pilot", min_length=1)
+    LANGSMITH_ENDPOINT: Annotated[str, BeforeValidator(check_str_is_http)] = (
         "https://api.smith.langchain.com"
     )
-    LANGCHAIN_API_KEY: SecretStr | None = None
+    LANGSMITH_API_KEY: SecretStr | None = None
+    LANGSMITH_WORKSPACE_ID: str | None = None
+    LANGSMITH_HIDE_INPUTS: bool = True
+    LANGSMITH_HIDE_OUTPUTS: bool = True
 
     LANGFUSE_TRACING: bool = False
     LANGFUSE_HOST: Annotated[str, BeforeValidator(check_str_is_http)] = "https://cloud.langfuse.com"
@@ -160,6 +164,11 @@ class Settings(BaseSettings):
     )
 
     def model_post_init(self, __context: Any) -> None:
+        if self.LANGSMITH_TRACING and (
+            self.LANGSMITH_API_KEY is None
+            or not self.LANGSMITH_API_KEY.get_secret_value().strip()
+        ):
+            raise ValueError("启用 LangSmith 时必须配置 LANGSMITH_API_KEY")
         api_keys = {
             Provider.OPENAI: self.OPENAI_API_KEY,
             Provider.OPENAI_COMPATIBLE: self.COMPATIBLE_BASE_URL and self.COMPATIBLE_MODEL,
