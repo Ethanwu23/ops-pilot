@@ -1,5 +1,6 @@
 import json
 import logging
+from datetime import UTC, datetime
 from time import perf_counter
 from typing import Literal
 from uuid import UUID
@@ -140,7 +141,7 @@ async def execute_tools(
     runtime = get_runtime()
     session_factory = runtime.context.business_session_factory
 
-    tool_logs_by_call_id: dict[str, tuple[int, float]] = {}
+    tool_logs_by_call_id: dict[str, tuple[int, float, datetime]] = {}
 
     for tool_call in request_message.tool_calls:
         tool_call_id = tool_call.get("id")
@@ -169,9 +170,16 @@ async def execute_tools(
             tool_log_id=tool_log_id,
         )
 
+        # UTC 时间用于定位日志，单调时钟用于计算耗时，避免系统校时影响。
+        started_at = datetime.now(UTC)
         tool_logs_by_call_id[tool_call_id] = (
             tool_log_id,
             perf_counter(),
+            started_at,
+        )
+        logger.info(
+            "工具开始执行：diagnosis_run_id=%s tool_call_id=%s tool_name=%s started_at=%s",
+            diagnosis_run_id, tool_call_id, tool_name, started_at.isoformat(),
         )
 
     tool_node = ToolNode(
@@ -193,7 +201,8 @@ async def execute_tools(
     has_failed_tool = False
 
     for message in validated_tool_messages:
-        tool_log_id, tool_started_at = tool_logs_by_call_id[message.tool_call_id]
+        tool_log_id, tool_started_at, started_at = tool_logs_by_call_id[message.tool_call_id]
+        finished_at = datetime.now(UTC)
         duration_ms = max(
             0,
             int((perf_counter() - tool_started_at) * 1000),
@@ -208,6 +217,12 @@ async def execute_tools(
                 tool_log_id=tool_log_id,
                 error_message=message.content,
                 duration_ms=duration_ms,
+            )
+            logger.warning(
+                "工具执行结束：diagnosis_run_id=%s tool_call_id=%s status=failed "
+                "started_at=%s finished_at=%s duration_ms=%s",
+                diagnosis_run_id, message.tool_call_id,
+                started_at.isoformat(), finished_at.isoformat(), duration_ms,
             )
             has_failed_tool = True
             continue
@@ -227,6 +242,12 @@ async def execute_tools(
                 error_message="工具结果不是有效的 JSON",
                 duration_ms=duration_ms,
             )
+            logger.warning(
+                "工具执行结束：diagnosis_run_id=%s tool_call_id=%s status=failed "
+                "started_at=%s finished_at=%s duration_ms=%s",
+                diagnosis_run_id, message.tool_call_id,
+                started_at.isoformat(), finished_at.isoformat(), duration_ms,
+            )
             has_failed_tool = True
             continue
 
@@ -237,6 +258,12 @@ async def execute_tools(
                 error_message="工具结果 JSON 必须是对象",
                 duration_ms=duration_ms,
             )
+            logger.warning(
+                "工具执行结束：diagnosis_run_id=%s tool_call_id=%s status=failed "
+                "started_at=%s finished_at=%s duration_ms=%s",
+                diagnosis_run_id, message.tool_call_id,
+                started_at.isoformat(), finished_at.isoformat(), duration_ms,
+            )
             has_failed_tool = True
             continue
 
@@ -245,6 +272,12 @@ async def execute_tools(
             tool_log_id=tool_log_id,
             result_summary=result_summary,
             duration_ms=duration_ms,
+        )
+        logger.info(
+            "工具执行结束：diagnosis_run_id=%s tool_call_id=%s status=succeeded "
+            "started_at=%s finished_at=%s duration_ms=%s",
+            diagnosis_run_id, message.tool_call_id,
+            started_at.isoformat(), finished_at.isoformat(), duration_ms,
         )
 
     if has_failed_tool:
@@ -356,8 +389,8 @@ async def analyze_evidence(
 
         if not isinstance(analysis, AnalysisResult):
             logger.error(
-                "模型分析返回类型不符合要求：actual_type=%s",
-                type(analysis).__name__,
+                "模型分析返回类型不符合要求：diagnosis_run_id=%s actual_type=%s",
+                state["diagnosis_run_id"], type(analysis).__name__,
             )
             raise TypeError("模型分析结果必须是 AnalysisResult")
 
@@ -390,8 +423,8 @@ async def analyze_evidence(
 
     except OpenAIError as exc:
         logger.error(
-            "模型分析调用失败：error_type=%s",
-            type(exc).__name__,
+            "模型分析调用失败：diagnosis_run_id=%s error_type=%s",
+            state["diagnosis_run_id"], type(exc).__name__,
         )
         return {
             "analysis": None,
@@ -405,8 +438,8 @@ async def analyze_evidence(
         ValueError,
     ) as exc:
         logger.error(
-            "模型分析结果校验失败：error_type=%s",
-            type(exc).__name__,
+            "模型分析结果校验失败：diagnosis_run_id=%s error_type=%s",
+            state["diagnosis_run_id"], type(exc).__name__,
         )
         return {
             "analysis": None,

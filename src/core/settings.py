@@ -76,6 +76,11 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     PORT: int = 8080
     GRACEFUL_SHUTDOWN_TIMEOUT: int = 30
+
+    # 本地测试指标服务的地址、单次 HTTP 超时和进程内并发上限。
+    METRICS_BASE_URL: Annotated[str, BeforeValidator(check_str_is_http)] = "http://127.0.0.1:8081"
+    METRICS_TIMEOUT_SECONDS: float = Field(default=2.0, gt=0)
+    METRICS_MAX_CONCURRENCY: int = Field(default=2, gt=0)
     LOG_LEVEL: LogLevel = LogLevel.WARNING
 
     JWT_SECRET: SecretStr

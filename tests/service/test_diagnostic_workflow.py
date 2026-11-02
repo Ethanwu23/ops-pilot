@@ -1,6 +1,8 @@
 import asyncio
 import json
+import logging
 import os
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
@@ -465,3 +467,78 @@ async def test_postgres_failure_finalizer_is_atomic(postgres_case):
     finally:
         async with case.engine.begin() as connection:
             await connection.execute(text(f"ALTER TABLE diagnosis_runs DROP CONSTRAINT {constraint}"))
+
+
+@pytest.mark.asyncio
+async def test_trace_logs_link_resume_without_logging_question(diagnostic_case, caplog):
+    """请求、诊断和工具标识可关联，但不记录问题及工具原始数据。"""
+    case = diagnostic_case
+    caplog.set_level(logging.INFO, logger="service.service")
+    caplog.set_level(logging.INFO, logger="agents.diagnostic_nodes")
+    private_question = "这是仅用于检查日志的私密问题-marker-7812"
+    first = await send(case, message=private_question, path="stream")
+    first_frames = sse_events(first)
+    diagnosis_id = first_frames[-2]["diagnosis_run_id"]
+    second = await send(case, message="continue", path="stream")
+    second_frames = sse_events(second)
+    first_request_id = first_frames[-1]["run_id"]
+    second_request_id = second_frames[-1]["run_id"]
+    assert first_request_id != second_request_id
+    messages = [record.getMessage() for record in caplog.records if record.name in {"service.service", "agents.diagnostic_nodes"}]
+    assert any(f"run_id={first_request_id}" in message and "mode=new" in message for message in messages)
+    assert any(f"run_id={second_request_id}" in message and f"diagnosis_run_id={diagnosis_id}" in message and "mode=resume" in message for message in messages)
+    assert any(f"diagnosis_run_id={diagnosis_id}" in message and "tool_call_id=call-test" in message for message in messages)
+    assert any("流式执行结束" in message and "status=paused" in message for message in messages)
+    assert any("流式执行结束" in message and "status=succeeded" in message for message in messages)
+    assert private_question not in "\n".join(messages)
+    assert "cpu_percent" not in "\n".join(messages)
+
+
+@pytest.mark.asyncio
+async def test_unhandled_error_logs_type_not_exception_payload(diagnostic_case, caplog):
+    """外部异常可能携带敏感文本，普通错误日志仅记录类型和标识。"""
+    case = diagnostic_case
+    case.repositories["mark_tool_succeeded"].side_effect = RuntimeError("private-exception-marker-4621")
+    response = await send(case, path="stream")
+    frames = sse_events(response)
+    assert frames[-1]["status"] == "error"
+    logs = [record.getMessage() for record in caplog.records if record.name == "service.service"]
+    assert any("error_type=RuntimeError" in message and f"run_id={frames[-1]['run_id']}" in message for message in logs)
+    assert "private-exception-marker-4621" not in "\n".join(logs)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", [False, True], ids=["success", "timeout"])
+async def test_tool_timing_logs_include_times_without_sensitive_data(
+    diagnostic_case, caplog, monkeypatch, fault,
+):
+    """用户主导验收：起止时间齐全，成功失败耗时一致且不输出敏感原文。"""
+    case = diagnostic_case
+    caplog.set_level(logging.INFO, logger="agents.diagnostic_nodes")
+    caplog.set_level(logging.INFO, logger="service.service")
+    secrets = ["test-token-marker-917", "test-key-marker-284", "test-password-marker-563"]
+    case.client.headers["Authorization"] = f"Bearer {secrets[0]}"
+    if fault:
+        case.http_error = httpx.ReadTimeout(" ".join(secrets))
+    # 固定单调时钟间隔，验证记录的是实际计算值而非仅存在一个字段。
+    clock_values = iter([100.0, 100.125])
+    monkeypatch.setattr("agents.diagnostic_nodes.perf_counter", lambda: next(clock_values))
+    response = await send(case, message="测试问题 " + " ".join(secrets), path="stream")
+    frames = sse_events(response)
+    assert frames[-1]["status"] == ("failed" if fault else "paused")
+    tool_logs = [record.getMessage() for record in caplog.records if record.name == "agents.diagnostic_nodes"]
+    start_logs = [message for message in tool_logs if message.startswith("工具开始执行")]
+    finish_logs = [message for message in tool_logs if message.startswith("工具执行结束")]
+    assert len(start_logs) == len(finish_logs) == 1
+    start_fields = dict(item.split("=", 1) for item in start_logs[0].split("：", 1)[1].split() if "=" in item)
+    finish_fields = dict(item.split("=", 1) for item in finish_logs[0].split("：", 1)[1].split() if "=" in item)
+    assert start_fields["started_at"] == finish_fields["started_at"]
+    assert start_fields["tool_call_id"] == finish_fields["tool_call_id"] == "call-test"
+    assert start_fields["diagnosis_run_id"] == finish_fields["diagnosis_run_id"]
+    assert finish_fields["status"] == ("failed" if fault else "succeeded")
+    assert int(finish_fields["duration_ms"]) == 125
+    for field in ("started_at", "finished_at"):
+        timestamp = datetime.fromisoformat(finish_fields[field])
+        assert timestamp.utcoffset().total_seconds() == 0
+    logs = "\n".join(record.getMessage() for record in caplog.records if record.name in {"agents.diagnostic_nodes", "service.service"})
+    assert all(secret not in logs for secret in secrets)

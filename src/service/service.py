@@ -108,14 +108,14 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
             initialize_database() as saver,
             initialize_store() as store,
             httpx.AsyncClient(
-                base_url="http://127.0.0.1:8081",
-                timeout=2.0,
+                base_url=settings.METRICS_BASE_URL,
+                timeout=settings.METRICS_TIMEOUT_SECONDS,
                 trust_env=False,
             ) as metrics_client,
         ):
             # 保存可安全共享的资源。
             app.state.metrics_client = metrics_client
-            app.state.metrics_semaphore = asyncio.Semaphore(2)
+            app.state.metrics_semaphore = asyncio.Semaphore(settings.METRICS_MAX_CONCURRENCY)
             app.state.business_session_factory = business_session_factory
 
             # 初始化 LangGraph Checkpoint。
@@ -281,6 +281,13 @@ async def _handle_input(
         ),
     }
 
+    logger.info(
+        "诊断请求已准备：run_id=%s diagnosis_run_id=%s thread_id=%s mode=%s",
+        run_id,
+        config["configurable"]["diagnosis_run_id"],
+        thread_id,
+        "resume" if interrupted_tasks else "new",
+    )
     return kwargs, run_id
 
 
@@ -331,6 +338,12 @@ async def invoke(
             raise ValueError(f"Unexpected response type: {response_type}")
 
         output.run_id = str(run_id)
+        logger.info(
+            "普通请求响应已生成：run_id=%s diagnosis_run_id=%s status=%s",
+            run_id,
+            kwargs["config"]["configurable"]["diagnosis_run_id"],
+            "paused" if "__interrupt__" in response else response.get("status"),
+        )
         return output
     except asyncio.CancelledError:
         # 取消时完成业务收尾，然后继续传播取消信号。
@@ -345,7 +358,10 @@ async def invoke(
                 logger.exception("普通请求取消收尾失败：run_id=%s", run_id)
         raise
     except Exception as exc:
-        logger.error("普通请求执行异常：run_id=%s error=%s", run_id, exc)
+        logger.error(
+            "普通请求执行异常：run_id=%s diagnosis_run_id=%s error_type=%s",
+            run_id, kwargs["config"]["configurable"]["diagnosis_run_id"], type(exc).__name__,
+        )
         # 复用现有短事务，原子收尾诊断和未结束的工具日志。
         with anyio.CancelScope(shield=True):
             try:
@@ -504,6 +520,12 @@ async def message_generator(
         if terminal_status is None:
             raise RuntimeError("工作流结束但没有产生业务终态或中断")
 
+        logger.info(
+            "流式执行结束：run_id=%s diagnosis_run_id=%s status=%s",
+            run_id,
+            kwargs["config"]["configurable"]["diagnosis_run_id"],
+            terminal_status,
+        )
         yield (
             "data: "
             + json.dumps(
@@ -538,9 +560,10 @@ async def message_generator(
         raise
     except Exception as exc:
         logger.error(
-            "Error in message generator: run_id=%s error=%s",
+            "流式执行异常：run_id=%s diagnosis_run_id=%s error_type=%s",
             run_id,
-            exc,
+            kwargs["config"]["configurable"]["diagnosis_run_id"],
+            type(exc).__name__,
         )
 
         # 流式响应发生未处理异常时，先完成数据库状态收尾。
